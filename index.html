@@ -1,0 +1,2576 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>五维场 · 完美世界 · 全 GPU</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04060a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; pointer-events: none;
+    font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+    font-size: 11px; line-height: 1.62;
+    color: rgba(146, 202, 220, .46);
+    letter-spacing: .04em;
+  }
+  #hud { left: 16px; top: 14px; }
+  #hud b { color: rgba(198, 238, 248, .86); font-weight: 600; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud" id="hud"></div>
+
+<script>
+"use strict";
+const cv = document.getElementById('c');
+const hud = document.getElementById('hud');
+window.onerror = function (m, s, l) { hud.textContent = 'ERR: ' + m + ' @' + l; };
+
+/* π 数字串已移除：相位种子见下方"π 相位种子"块（改为确定性伪随机） */
+
+/* ============ 网格：10000 点 → 100×100 纹理 ============ */
+const NP = 10000, K = 4, GRID = 100;
+const P = new Float32Array(NP * 5);
+
+function gauss() {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+const g5 = new Float64Array(5);
+for (let i = 0; i < NP; i++) {
+  let s2 = 0;
+  for (let j = 0; j < 5; j++) { g5[j] = gauss(); s2 += g5[j] * g5[j]; }
+  const s = Math.sqrt(s2) || 1;
+  const r = 0.96 * Math.pow(Math.random(), 0.2);   // 5 维球均匀填满：r ∝ u^(1/5)，上限压在 0.96
+  for (let j = 0; j < 5; j++) P[i * 5 + j] = g5[j] / s * r;
+}
+
+/* ---- 5 维体素建边，同时记录每点邻居（GPU 用 gather 而非 scatter） ----
+   网格放大到 ±1.6，给球壳外的尘埃留出体素，否则它们全挤在边缘格、建边会退化 */
+const G = 13, GS = 4.0, NC = G * G * G * G * G;
+const head = new Int32Array(NC).fill(-1);
+const nxt = new Int32Array(NP).fill(-1);
+const cl = v => v < 0 ? 0 : (v >= G ? G - 1 : v);
+const cell5 = (a, b, c, d, e) => ((((a * G + b) * G + c) * G + d) * G + e);
+
+for (let i = 0; i < NP; i++) {
+  const o = i * 5;
+  const ci = cell5(cl(((P[o] + 1) * GS) | 0), cl(((P[o + 1] + 1) * GS) | 0),
+                   cl(((P[o + 2] + 1) * GS) | 0), cl(((P[o + 3] + 1) * GS) | 0),
+                   cl(((P[o + 4] + 1) * GS) | 0));
+  nxt[i] = head[ci]; head[ci] = i;
+}
+
+const NEI = new Int32Array(NP * K).fill(-1);
+const nbIdx = new Int32Array(K), nbDist = new Float32Array(K);
+
+for (let i = 0; i < NP; i++) {
+  for (let t = 0; t < K; t++) { nbDist[t] = Infinity; nbIdx[t] = -1; }
+  const o = i * 5;
+  const p0 = P[o], p1 = P[o + 1], p2 = P[o + 2], p3 = P[o + 3], p4 = P[o + 4];
+  const ix0 = cl(((p0 + 1) * GS) | 0), ix1 = cl(((p1 + 1) * GS) | 0),
+        ix2 = cl(((p2 + 1) * GS) | 0), ix3 = cl(((p3 + 1) * GS) | 0),
+        ix4 = cl(((p4 + 1) * GS) | 0);
+  for (let a = -1; a <= 1; a++) { const c0 = ix0 + a; if (c0 < 0 || c0 >= G) continue;
+    for (let b = -1; b <= 1; b++) { const c1 = ix1 + b; if (c1 < 0 || c1 >= G) continue;
+      for (let c = -1; c <= 1; c++) { const c2 = ix2 + c; if (c2 < 0 || c2 >= G) continue;
+        for (let d = -1; d <= 1; d++) { const c3 = ix3 + d; if (c3 < 0 || c3 >= G) continue;
+          for (let e = -1; e <= 1; e++) { const c4 = ix4 + e; if (c4 < 0 || c4 >= G) continue;
+            let j = head[cell5(c0, c1, c2, c3, c4)];
+            while (j !== -1) {
+              if (j !== i) {
+                const q = j * 5;
+                const d0 = P[q] - p0, d1 = P[q + 1] - p1, d2 = P[q + 2] - p2,
+                      d3 = P[q + 3] - p3, d4 = P[q + 4] - p4;
+                const dd = d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4;
+                if (dd < nbDist[K - 1]) {
+                  nbDist[K - 1] = dd; nbIdx[K - 1] = j;
+                  for (let t = K - 2; t >= 0; t--) {
+                    if (nbDist[t + 1] < nbDist[t]) {
+                      const td = nbDist[t]; nbDist[t] = nbDist[t + 1]; nbDist[t + 1] = td;
+                      const ti = nbIdx[t]; nbIdx[t] = nbIdx[t + 1]; nbIdx[t + 1] = ti;
+                    } else break;
+                  }
+                }
+              }
+              j = nxt[j];
+            }
+          }
+        }
+      }
+    }
+  }
+  for (let t = 0; t < K; t++) {
+    NEI[i * K + t] = nbIdx[t];
+  }
+}
+
+/* kNN 天然不对称：A 视 B 为邻居但 B 未必。强制互补，否则受力和反作用力对不上，结构会被拉长 */
+for (let i = 0; i < NP; i++) {
+  for (let t = 0; t < K; t++) {
+    const j = NEI[i * K + t];
+    if (j < 0) continue;
+    let has = false;
+    for (let s = 0; s < K; s++) if (NEI[j * K + s] === i) { has = true; break; }
+    if (has) continue;
+    let slot = -1;
+    for (let s = 0; s < K; s++) if (NEI[j * K + s] < 0) { slot = s; break; }
+    if (slot >= 0) NEI[j * K + slot] = i;
+    else NEI[i * K + t] = -1;
+  }
+}
+
+/* 从对称后的邻居表生成无向边（渲染用） */
+const edgeSet = new Set();
+for (let i = 0; i < NP; i++) {
+  for (let t = 0; t < K; t++) {
+    const j = NEI[i * K + t];
+    if (j < 0) continue;
+    const a = i < j ? i : j, b = i < j ? j : i;
+    edgeSet.add(a * NP + b);
+  }
+}
+
+const EDGE_N = edgeSet.size;
+const edges = new Int32Array(EDGE_N * 2);
+{
+  let w = 0;
+  for (const key of edgeSet) { edges[w++] = Math.floor(key / NP); edges[w++] = key % NP; }
+}
+
+let L0 = 0;
+for (let e = 0; e < EDGE_N; e++) {
+  const a = edges[e * 2], b = edges[e * 2 + 1];
+  let d2 = 0;
+  for (let j = 0; j < 5; j++) { const t = P[a * 5 + j] - P[b * 5 + j]; d2 += t * t; }
+  L0 += Math.sqrt(d2);
+}
+L0 /= EDGE_N;
+
+/* ==================== 内层 / 上层（14 号脑模型的分层） ====================
+   内层：节点自己跑四力、层半径、生态的那个 5 维球。
+   上层：一个只读观测层——按 8 个中心的最近归属把 10000 个点编成条地址
+        addr = cid*per + rid（cid 中心号、rid 组内序号），只读不写回物理。
+   14 号测过：上层只要不写进节点层，内层下界一字不差（覆盖比 1.00×）。 */
+const NCEN = 8;
+const CENTERS = new Float32Array(NCEN * 5);
+/* 8 个中心放在立方体的 8 个顶点方向上，前三维互相分开，
+   这样 x₃/x₄ 被折叠进尺寸/色相之后，画面上仍能看出 8 个扇区 */
+const CDIR = [[1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
+              [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1]];
+for (let c = 0; c < NCEN; c++) {
+  const R = 0.42;
+  for (let j = 0; j < 3; j++) CENTERS[c * 5 + j] = CDIR[c][j] / Math.sqrt(3) * R;
+  CENTERS[c * 5 + 3] = CDIR[c][0] * 0.10;      /* 后两维给一点偏移，中心不会共面 */
+  CENTERS[c * 5 + 4] = CDIR[c][1] * 0.10;
+}
+
+/* π 相位种子：已移除 π 数字串，改由确定性伪随机（mulberry32，固定种子）产生。
+   取值范围与原来"三位 π 数字加权 ×2"得到的 [0, ~22] 同分布；驱动公式与参数一字未动 */
+const PSEED = new Float64Array(NP);
+const PSIN = new Float64Array(NP), PCOS = new Float64Array(NP);
+let _s32 = 20261116;
+for (let i = 0; i < NP; i++) {
+  _s32 = (_s32 + 0x6D2B79F5) | 0;
+  let t = _s32;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  const rnd = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  PSEED[i] = rnd * 21.98;
+  PSIN[i] = Math.sin(PSEED[i]);
+  PCOS[i] = Math.cos(PSEED[i]);
+}
+
+const RL = {
+  STIFF: 2.6, REP: 3e-5, GR: 6e-4, EL: 2.5e-4, KS: 0.55,  GA: 3e-4, LAM: 0.05, DAMP: 0.996, DT: 1 / 80, RMAX: 0.97,
+  RVOL: 0.785, DRV: 0.065, EAT: 0.8, BURN: 0.18, LIGHT: 1.15,
+  /* LEAK 0.07 是四档扫描的最优点（256 步记录、交叉验证、单变量 ⟨m⟩ 预测 uS）：
+     LEAK  峰R²   峰lag(秒)   MC      PR     加 m
+     0.05  0.424  23 (5.75)   5.5   6.42   5.63
+     0.07  0.490  23 (5.75)   8.0   6.41   5.60   ← 定稿
+     0.08  0.493  23 (5.75)   8.0   6.29   5.50
+     0.10  0.741   2 (0.50)   5.3   6.47   5.66
+     0.25  0.658   0 (0.00)   4.2   6.18   5.42   （旧值，σ(m) 只剩 0.146）
+     τ 短则幅度高但滞后短，τ 长则滞后长但幅度低；0.07 在两者上都够用，
+     且 PR / C₀ / 加 m 三项都没掉。 */
+  MEM: 1.0, LEAK: 0.07, HMIX: 0.8,
+  /* 能量生成弱力：qw = e − ⟨e⟩ 直接当短程力的权重。qw 有正有负，
+     高能节点强吸引、低能节点弱/反斥 —— 能量差就这样变成节点间的作用力。 */
+  QW: 3.0,
+  /* 维度层级流：LV 每帧把 lvl 往下推 → 5→0 约 44 秒一圈；ABS 在 0 维抽能量（约 20%/秒）；
+     EM 是电磁导流率（只搬 e，不碰坐标） */
+  LV: 0.15,
+  ABS: 0.15,
+  EM: 0.0,
+  /* LAY：最小化层半径开关（0 = 单一 L₀，1 = 按出生半径分 3 档） */
+  LAY: 1.0,
+  /* RAD：层半径径向约束强度。0 = 关闭（回到无层的单球壳行为） */
+  RAD: 4.0,
+  /* ── P0 · 选择性时间步（Mamba 的输入依赖 Δ）───────────────────────────
+     之前输入只调 k0 与 plantGain 的幅度，实测"只贡献 <1% 方差"，原因：
+     e 的 98% 方差被 3.74 s 相位钟占着，0.25 s 的输入比它快 15 倍，
+     会被相位直接平均掉 —— 幅度注入在相位主导的系统里留不下痕迹。
+     改法：让输入调相位钟本身的推进速率，CLK(t) = Σ 0.028*(1+u·INSEL)。
+     u 均值为 0，所以 CLK 变成围绕基线的随机游走 —— 输入的信息以
+     "相位偏移"的形式累积下来，且永不衰减（相积累型记忆）。
+     INSEL = 0 时退回原行为，可实时 A/B。 */
+  INSEL: 0.60
+};
+
+/* 内层立方体下界：2.0 = 不约束（点本来就在 ±0.97 的球内）。按 B 逐级收紧，看它在哪一档失效 */
+const BOX_STEPS = [2.0, 1.0, 0.6, 0.3, 0.15, 0.05];
+let BOX = 2.0, boxIdx = 0;
+function boxCycle() {
+  boxIdx = (boxIdx + 1) % BOX_STEPS.length;
+  BOX = BOX_STEPS[boxIdx];
+}
+
+/* ============ WebGL2 ============ */
+const gl = cv.getContext('webgl2', { antialias: false, alpha: false, premultipliedAlpha: false, powerPreference: 'high-performance', preserveDrawingBuffer: true });
+if (!gl) { hud.textContent = 'WebGL2 不可用'; throw new Error('no webgl2'); }
+if (!gl.getExtension('EXT_color_buffer_float')) { hud.textContent = '浮点纹理渲染不可用'; throw new Error('no float fbo'); }
+
+function makeTex(internalFormat, format, type, data) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, GRID, GRID, 0, format, type, data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+/* 初始状态填进纹理数据 */
+const dPA = new Float32Array(NP * 4), dPB = new Float32Array(NP * 4);
+const dVA = new Float32Array(NP * 4), dVB = new Float32Array(NP * 4);
+for (let i = 0; i < NP; i++) {
+  const o = i * 5, b = i * 4;
+  const x0 = P[o], x1 = P[o + 1], x2 = P[o + 2], x3 = P[o + 3], x4 = P[o + 4];
+  /* 出生半径标签：写一次就不再变，只用来区分内外（层半径机制已删除） */
+  const r0 = Math.max(0.02, Math.sqrt(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3 + x4 * x4));
+  dPA[b] = x0; dPA[b + 1] = x1; dPA[b + 2] = x2; dPA[b + 3] = r0;
+  dPB[b] = x3; dPB[b + 1] = x4; dPB[b + 2] = PSIN[i]; dPB[b + 3] = PCOS[i];
+  dVB[b + 2] = r0;   /* 出生半径（静态标签） */
+  dVA[b + 3] = 0.35 + 0.40 * Math.random();   /* 初始代谢量：跨越双稳态临界，让涨落自己决定生死 */
+  dVB[b + 3] = 0.05 + 0.25 * Math.random();   /* 初始型：绝大多数是植物，少数是动物 */
+}
+
+/* 邻居纹理 (RGBA32I) */
+const dNEI = new Int32Array(NP * 4);
+for (let i = 0; i < NP; i++) {
+  for (let t = 0; t < K; t++) dNEI[i * 4 + t] = NEI[i * K + t];
+}
+
+/* 基因纹理：x=先天光合效率（0.85~1.15，终生不变），y=存活年龄，z=备用 */
+const dG = new Float32Array(NP * 4);
+for (let i = 0; i < NP; i++) {
+  dG[i * 4] = 1.0 + (Math.random() - 0.5) * 0.40;   /* 均值 1.0 的初始基因库 */
+  dG[i * 4 + 1] = 0;
+  dG[i * 4 + 3] = 1;
+}
+
+/* 上层记忆纹理（第 6 张，attachment5）：x=累积记忆 m，y=记忆变化率 dm/dt，z=条内序位，
+   w=维度层级 lvl（5=五维全活跃，0=只剩标量）。lvl 用黄金分割散列错开初值，避免全体同步下沉成脉冲。 */
+const dH = new Float32Array(NP * 4);
+for (let i = 0; i < NP; i++) { dH[i * 4 + 3] = 0.4 + 4.6 * ((i * 0.6180339887) % 1.0); }
+
+/* 每点相位预测器系数（本轮新增，第 7 条通道）：
+   x=a0 偏置、y=a1 cos 系数、z=b1 sin 系数、w=上一帧误差 δ。
+   学的是 e ≈ a0 + a1·cos(2πψ) + b1·sin(2πψ)，ψ 是该点自己的本地相位。
+   全局版已经测到相位能解释 ⟨e⟩ 97.6–98.0% 的方差、跨圈 δ 只有 0.019，
+   这一层就是把它搬到每个点上一份。初值全 0 = 从"预测 0"开始学。 */
+const dP = new Float32Array(NP * 4);
+/* 初值给 w=1、b=0，也就是"直接复制上一帧的 e"。
+   这不是作弊，是把已经测出来的最优解当先验：单点自预测的最优解本来就是恒等
+   （全局版 w 收敛到 1.00 也说明同一件事）。学习只负责在这个起点上做微调，
+   否则从 0 起步、233 步根本爬不到 1。 */
+for (let i = 0; i < NP; i++) { dP[i * 4] = 1.0; }
+
+const TEX_A = [
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dPA),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dPB),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dVA),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dVB),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dG),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dH),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dP)
+];
+const TEX_B = [
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dPA),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dPB),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dVA),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dVB),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dG),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dH),
+  makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dP)
+];
+const TEX_NEI = makeTex(gl.RGBA32I, gl.RGBA_INTEGER, gl.INT, dNEI);
+
+function makeFBO1(tex) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) throw new Error('NFBO ' + st);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return f;
+}
+/* 上层索引纹理：每格存 (cid, 到中心的距离, 组内序号, 1)，只读，不进物理 */
+const dID0 = new Float32Array(NP * 4);
+const TEX_IDX = makeTex(gl.RGBA32F, gl.RGBA, gl.FLOAT, dID0);
+const IFBO = makeFBO1(TEX_IDX);
+
+function makeFBO(texs) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  for (let i = 0; i < texs.length; i++) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, texs[i], 0);
+  const atts = [];
+  for (let i = 0; i < texs.length; i++) atts.push(gl.COLOR_ATTACHMENT0 + i);
+  gl.drawBuffers(atts);
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) throw new Error('FBO ' + st);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return f;
+}
+const FBO_A = makeFBO(TEX_A);
+const FBO_B = makeFBO(TEX_B);
+
+function mkShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function mkProg(vs, fs, tf) {
+  const p = gl.createProgram();
+  gl.attachShader(p, mkShader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, mkShader(gl.FRAGMENT_SHADER, fs));
+  if (tf) gl.transformFeedbackVaryings(p, tf, gl.INTERLEAVED_ATTRIBS);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+/* ---------- 物理：全屏 fragment ---------- */
+const PHYS_FS = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp isampler2D;
+
+uniform sampler2D uPA;
+uniform sampler2D uPB;
+uniform sampler2D uVA;
+uniform sampler2D uVB;
+uniform sampler2D uG;
+uniform sampler2D uH;
+uniform sampler2D uIDX;
+uniform sampler2D uP;
+uniform isampler2D uNEI;
+
+layout(location=0) out vec4 oPA;
+layout(location=1) out vec4 oPB;
+layout(location=2) out vec4 oVA;
+layout(location=3) out vec4 oVB;
+layout(location=4) out vec4 oG;
+layout(location=5) out vec4 oH;
+layout(location=6) out vec4 oP;   /* 每点相位预测器系数 (a0, a1, b1, δ) */
+
+uniform float uL0, uStiff, uRep, uGr, uEl, uKs, uGa, uLam;
+uniform float uDT, uDamp, uRmax, uDrv, uCC, uSC, uEat, uBurn, uLight, uBox;
+uniform float uMem, uLeak, uMix, uPredEta, uWrite, uWritePh;
+uniform float uWE[16];
+uniform float uClkPh;
+/* 输入口：储备池实测用，不记录时恒为 0，稳态不受影响 */
+uniform float uIn;
+/* 电磁力：电荷 = 能量偏离全场平均。能量高于平均为正、低于为负，
+   同号相斥、异号相吸 —— 能量的差值就这样变成 5 维空间里的位移。 */
+uniform float uQ, uEbar;
+/* 维度层级流：uLV = 层级下沉速度，uAbs = 0 维汇的吸收率，uEM = 电磁导流率 */
+uniform float uLV, uAbs, uEM;
+/* uLay：最小化层半径的开关，0 = 单一 L₀，1 = 按 3 档分层 */
+uniform float uLay;
+/* uRad：层半径的径向约束强度（约束的是点到原点的距离，不是邻居链长） */
+uniform float uRad;
+
+void main() {
+  ivec2 uv = ivec2(gl_FragCoord.xy);
+
+  vec4 pa = texelFetch(uPA, uv, 0);
+  vec4 pb = texelFetch(uPB, uv, 0);
+  vec4 va = texelFetch(uVA, uv, 0);
+  vec4 vb = texelFetch(uVB, uv, 0);
+  vec4 gt = texelFetch(uG, uv, 0);
+  vec4 ht = texelFetch(uH, uv, 0);   /* previous-frame memory */
+  float cid = texelFetch(uIDX, uv, 0).x;   /* previous-frame centre id, upper layer input */
+
+  vec3 p0 = pa.xyz;
+  vec2 p1 = pb.xy;
+  vec3 v0 = va.xyz;
+  vec2 v1 = vb.xy;
+
+  ivec4 nei = texelFetch(uNEI, uv, 0);
+
+  vec3 acc0 = vec3(0.0);
+  vec2 acc1 = vec2(0.0);
+
+  /* 节点自己的相位：sd/cs 是这颗节点自带的种子（伪随机，每点不同），
+     与全局时钟 CLK 合成 sp —— 因此每个节点的核力翻转时刻互不相同 */
+  float sd = pb.z, cs = pb.w;
+  float sp = sd * uCC + cs * uSC;
+  float cp = cs * uCC - sd * uSC;
+
+  /* 层半径 v1 失败记录：把弹簧目标 uL0 换成 3 档（0.35/0.525/0.70）后
+     r 分布仍然是单峰、x₀x₁x₂ 一点没动 —— 因为邻居弹簧约束的是链长不是原点半径。
+     已改为对径向距离单独施加约束，见文件末尾的层半径 v2。 */
+
+  float rsum = 0.0, rsumE = 0.0, cnt = 0.0;
+  float smN = 0.0;    /* 邻居的平滑场之和（G.z） */
+  float hsum = 0.0;   /* neighbour memory mean, read-only */
+  /* ── 试过的"坐标 → m"公式，全部无效（记录）──────────────────────────
+     方向序参量 S = |Σ(p_j−p_i)/|p_j−p_i||/K：K=4 的邻居在固定拓扑上
+     几乎总是那四个方向，所以 S 是个接近常数 0.76 的量（σ≈0.10），
+     它的涨落来自点的位移而不是"点在哪" —— 把 β=0.45 的 (S−0.45) 加进
+     driveM 之后 ⟨m⟩ 从 0.016 抬到 0.549（说明项真的进了），但
+     R²(5坐标→m) 从 0.0033 变成 0.0024、corr(m,x_i) 仍全在 ±0.03。
+     教训：在固定拓扑下，凡"由坐标导出但批量平均掉的量"都会变成常数。
+     唯一会变的是位移量 |r−L₀|，而它已经被弹簧独占 —— 这就是为什么
+     坐标里的信息没有第二条出口。 */
+
+  /* 失衡电荷：强力强度 (1−0.6sp) 与弱力强度 (1+4qw) 的不平衡。
+     sp 是正弦、qw 随 cp（余弦）走，所以这个电荷本身就在做圆周摆动 —— 它编码了两力的相位差。 */
+  /* 弱力基准试过改成"本点邻域均值"（qw = e − eNbL），目的是消掉全局净排斥：
+     实测失败 —— 4 个邻居的 qw 互相抵消，弱力退化成高频噪声，
+     PR 5.20→4.63、x₀x₁x₂ 2.23→2.07。已回滚，保留相对全局 ⟨e⟩ 的基准。 */
+  float qw = va.w - uEbar;
+  /* ── e → 坐标：三条路全堵死（时间平均复核后的定论）────────────────────
+     ① 额外加力（径向/横向洛伦兹）：改写被弹簧独占的尺度自由度 → 膨胀成壳，
+        ⟨r⟩ 0.70→0.84–0.91、PR→4.8–5.0（三种写法都试过）。
+     ② 改弹簧刚度（k = uStiff·(1+α·(e−0.8)/0.2)，α 0.08/0.15/0.30）：
+        统计上完全不可区分 —— 26 s 平均值 PR 6.90±0.02（基线 6.90±0.03）、
+        加 e 5.91±0.02、C₀ 0.249±0.086（基线 0.226±0.081）。
+        原因不是不稳，是**没有稳态效应**：k 只改围绕 L₀ 的振动幅度，
+        平衡点几乎不动（α=0.30 时 r_eq 位移 0.006），而 HUD 全是均值量。
+     ③ 改目标长度 L₀（层半径 v1/v2）：完全无效或 86% 坍缩到最外档。
+     结论：坐标 → e 只能走单向低速通道（平滑场 smOld，见 want0 那行）。
+     e 反向作用到坐标在现有结构里无解 —— 因为"尺度"这一维被弹簧独占，
+     任何改它的方式都会破坏它，而不破坏就没有可测效果。 */
+  float kStiffLoc = uStiff;
+  /* 电磁力（第三力平衡器）已撤除：三种写法实测都会让球持续膨胀 ——
+     ① 径向反馈 −uQB·qBal·(r−L₀)：⟨r⟩ 0.70→0.90，PR 5.70→4.82；
+     ② 局部中心化后同式：⟨r⟩→0.905 冻结成壳，r 分布 71% 贴最外档，σ(m) 0.500→0.325、条 62→48；
+     ③ 横向洛伦兹 (v×r̂)：不做径向功，但换来离心，⟨r⟩→0.843，PR→5.04。
+     根本原因是任何额外力都在改写弹簧独占的尺度自由度，而交替震荡本身已经在让 ⟨r⟩ 慢摆（0.70↔0.79）。
+     要接回电磁力，必须让它只作用于能量而不是坐标 —— 见 dev/ 下的记录。 */
+  for (int t = 0; t < 4; t++) {
+    int j = nei[t];
+    if (j < 0) continue;
+    ivec2 uj = ivec2(j % 100, j / 100);
+    vec4 qa = texelFetch(uPA, uj, 0);
+    vec4 qb = texelFetch(uPB, uj, 0);
+    vec4 qv = texelFetch(uVA, uj, 0);
+
+    vec3 d0 = p0 - qa.xyz;
+    vec2 d1 = p1 - qb.xy;
+    float r2 = dot(d0, d0) + dot(d1, d1) + 1e-8;
+    float r = sqrt(r2);
+    /* 弱力也放到节点上：短程指数衰减项乘这颗节点自己的余弦相位 cp（与强力的 sp 错开 90°），
+       于是同一节点上强力涨时弱力落、弱力涨时强力落，两种力的主导权按节点各自交替。
+       注意量级：uGa·e^{-L₀/uLam} ≈ 3e-4·e^{-3.46} ≈ 9.4e-6，而弹簧项在 |r−L₀|≈0.01 时是 0.026，
+       弱力只占约 0.04%，节点化之后仍然测不动全局统计。 */
+    /* 弱力由能量生成：强度不再是常数 uGa，而是这颗节点自己的能量偏离 qw = e − ⟨e⟩。
+       能量高于平均的节点对邻居有强短程吸引，低于平均的短程力变弱甚至反号变排斥。
+       uQ·qw·e^{-L₀/uLam} ≈ 3·0.06·0.031 ≈ 0.0056，约为弹簧项（0.026）的 21% —— 这个量级才测得动。 */
+    /* 电磁项：把"强力与弱力谁偏了"这个失衡量 qLoc 变成横向偏转力（见下方洛伦兹行）。 */
+    float F = kStiffLoc * (r - uL0) - uRep / (r2 + 1e-4) + uGr / r2 - uEl / r2
+            - uKs * (r - uL0) * (1.0 - sp * 0.6) + uQ * qw * exp(-r / uLam);
+    /* 电磁项已撤除（见上方说明）。 */
+    float inv = F / r;
+    acc0 -= d0 * inv;
+    acc1 -= d1 * inv;
+
+    rsum += qa.w;
+    rsumE += qv.w;
+    hsum += texelFetch(uH, uj, 0).x;
+    smN += texelFetch(uG, uj, 0).z;
+    cnt += 1.0;
+  }
+
+  /* 节点相位（sd/cs/sp/cp）已在邻居循环前算出，供强力与驱动共用 */
+
+  /* 层半径自动演化已删除：不再呼吸、不再向邻居渗透、不再回归自己的层 */
+  float e = va.w;
+  float r0b = max(vb.z, 0.02);
+
+  /* 两个类群：植物从光带取能，动物吃邻居。role∈[0,1] 是每个点自己的型 */
+  float role = vb.w;
+  float eNb = cnt > 0.0 ? rsumE / cnt : 0.0;
+  /* ── 平滑场（落在 G.z 这个一直空着的通道）────────────────────────────
+     目的：给"坐标 → 能量"造一个能用的接口。裸坐标和单跳邻居质心都在
+     邻居之间剧烈跳变（K=4 的邻居集只有一半重合），等效白噪声，接进
+     k0 直接把 C₀ 从 0.24 打到 0.03。这里改成读邻居的 G.z、写自己的 G.z
+     （同一帧不同 texel，合法），用迭代扩散把场抹平：
+       · 扩散项 0.30/帧向邻居均值收敛
+       · 驱动项 0.020/帧把场慢慢拉向当前位置 x₀/σ
+       稳态关联长度 ≈ sqrt(0.30/0.020) ≈ 3.9 跳 ≈ 0.67，是球半径的量级。
+     场的时间常约 50 帧（0.6 s），远慢于 e 的 0.3 s，所以不构成快速反馈。 */
+  float smOld = gt.z;
+  float smAvg = cnt > 0.0 ? smN / cnt : smOld;
+  float smNew = smOld + (smAvg - smOld) * 0.30 + (p0.x / 0.075 - smOld) * 0.020;
+  smNew = clamp(smNew, -3.0, 3.0);
+  /* 光随局部能量走：邻居富的地方更亮，产出有正反馈，e 才可能结块。
+     原来是常数 1.0（全空间均匀），这正是 e 没有空间结构的原因之一。 */
+  float lit = 0.72 + 0.56 * clamp(eNb, 0.0, 1.0);
+  /* 植物：直接吃光，没有能流扩散、没有养分场，产出只受自己 e 与基因限制 */
+  float gene = gt.x;
+  /* 每个点的能量大小由 cp（余弦相位）驱动，而核力用的是 sp（正弦相位）——
+     两者差 90°，所以强力涨到顶时弱力正好落到谷，弱力涨到顶时强力落到谷。
+     能量一滞后，弱力（由 e 决定）就自动与强力错相交替，周期 ≈ 3.7 s（CLK 一圈 224 帧）。 */
+  float plantGain = uLight * lit * (1.0 - e) * 1.25 * (1.0 - 0.6 * role) * gene * (1.0 - cp * 0.6);
+  /* ── 输入口（储备池实测）───────────────────────────────────────────
+     uIn ∈ [−1, +1]，由 JS 每 8 帧（0.1 s）换一次的二值序列驱动。
+     乘性调制、不是加法：光合是 e 的源项，乘性注入要经过 burn 与邻域
+     搬运才会在 e 上显现，因此带非线性（e 有 0..1 的 clamp）。
+     空间权重 win 用出生半径（连续、与几何位置无关）—— 若权重全场相同，
+     输入会把所有点推向同一相，抽掉后状态里什么也留不下。 */
+  float win = 0.30 + 0.70 * clamp(0.5 + 0.5 * sin(6.2831853 * (vb.z * 2.2)), 0.0, 1.0);
+  plantGain *= (1.0 + uIn * 0.55 * win);
+  /* ── 8 维写通道（本轮新增）─────────────────────────────────────────
+     读已经通了（⟨e⟩ 相位 R² 0.973、跨圈 δ 0.016），缺的是"写"。
+     写不需要 16 个相位箱的存储 —— 只要一行相位门：
+       wGate = 半波(sin(2π(ψ−uWritePh))) ∈ [0,1]
+     它让这个点只在"自己相位的某一段"被额外灌能量，其余相位完全不动。
+     每个点用的是自己的本地相位 ψ，所以写入天然按相位错开，而不是全场同时。
+     uWrite = 0 时整项恒等（(1+0)=1），物理一点不改 —— 可以用它做干净的对照。 */
+  float wGate = clamp(0.5 + 0.5 * sin(6.2831853 * (pa.w - uWritePh)), 0.0, 1.0);
+  plantGain *= (1.0 + uWrite * wGate);
+  float gain = plantGain;
+  /* 型随环境迁移：判据是能否自养 —— 光的产出盖过耗散就做植物 */
+  float auto = uLight * lit * 1.25 * gene - uBurn;
+  role += (-auto * 1.8 + (eNb - 0.35) * 0.5) * uDT * 2.0;
+  role = clamp(role, 0.0, 1.0);
+  /* 代谢更新：基因同时定产率与基础耗散，高效率个体净收益更高，自然选择才有梯度 */
+  float burnEff = uBurn * (2.0 - gene);
+  e = clamp(e + (gain - burnEff) * uDT * 2.5, 0.0, 1.0);
+
+  /* ── 0 维 ↔ 6 维（能量维）反相统一跳动 ─────────────────────────────
+     H.w 承载 lvl：5 = 五维全活跃，0 = 只剩标量。
+     · 0 维不再"凭空吸走"能量，而是升格成储能池 sc（存在 G.w，这个通道一直闲置）。
+     · 两个维度共用同一个全局相位 uCC：0 维目标占比 = (1-uCC)/2，能量维 = (1+uCC)/2，
+       和恒为 1 —— 能量只在两维之间搬运，一边涨另一边必落，这就是"相反的统一跳动"。
+     · 6 维从 0 维抽：uCC 上行半圈里 sc 被抽干、e 被灌满，下行半圈反过来。
+     · 抽运强度随 lvl 加大：越靠近 0 维的点，搬运越彻底。
+     全程不碰坐标 ⇒ 尺度那一维仍由弹簧独占。 */
+  float lvl = ht.w;
+  lvl -= uLV * uDT;
+  if (lvl < 0.0) lvl = 0.0;
+
+  float sc = gt.w;                                   /* 0 维储能池 */
+  float near0 = clamp(1.0 - lvl / 5.0, 0.0, 1.0);    /* 离 0 维多近 */
+  /* 逐点相位偏置：所有点共用一个 want0 时，搬运完全同相，画面上没有任何空间差异
+     （实测 C₀≈±0.01、ξ<0.02）。这里按出生半径与基因给每个点错开一点相位，
+     全体平均仍等于 0.5-0.5*uCC —— 反相统一跳动保留，个体之间分化出来。 */
+  /* 用出生半径做相位：它是连续函数，邻居之间自然相近，能长出长波；
+     不能掺逐点随机基因（那是白噪声，会把相关函数在最近邻就打平）。
+     幅值 0.30 是实测折中：再大 C₀ 更强，但 e 与坐标共线，PR 会掉到 5.6。 */
+  float bias = 0.30 * sin(6.2831853 * (vb.z * 2.5));
+  /* 平滑场 → 目标值：定稿 0.12。0 / 0.12 / 0.25 / 0.40 四档的 C₀ 是
+     0.241 / 0.251 / 0.242 / 0.260，PR 是 6.91 / 6.92 / 6.84 / 6.89 ——
+     0.25 与 0.40 的读数被 3.74 s 相位钟的波动淹没，无法稳定归因，
+     所以取最小可用幅度，把维数余量留给别的改动。 */
+  /* ── 第 8 维（逐点相位）接入实测记录，已回退 ─────────────────────────
+     系统里一直存在第 8 个自由度：每点自带相位种子 sd=pb.z, cs=pb.w，
+     sp/cp 就是逐点相位。但 e 的驱动 want0 用的是全局 uCC，所以能量起伏
+     全体同相（逆推也是这么来的：corr(e,ph_sin)=0.56，32% 方差来自时钟）。
+     把 sp 以 0.30 权重掺进 want0 后实测：PR 6.88±0.04、加 e 5.89±0.04、
+     C₀ 0.175±0.072（基线 6.89/5.91/0.232）—— 三项全降，ξ 只从 0.025 到 0.031。
+     原因不是接线错了，是**两个量本来就相关**：相位已经是 e 方差的主来源，
+     把它接回 e 等于把两个相关量合并成一个，有效维数只会减少。
+     更根本的一条：PR 6.91/7 意味着 7 个方向已经几乎正交满秩。**耦合与维数
+     是对立的** —— 让 7 维互相覆盖，必然把正交性换成相关性，PR 只会降。
+     所以"全覆盖形成第 8 维"在现有变量空间里不可能。要第 8 维，只能新增
+     一个**独立的动力学变量**（自己的方程、第 3 个时间尺度），而不是把
+     已有的量接在一起。 */
+  /* ── 第 8 维 θ（Kuramoto 振荡子）实测记录，已回退 ───────────────────
+     给每个点一个内禀频率 ω_i = 0.026 + 0.020·vb.z（周期 2.1–4.2 s，由出生
+     半径决定），再用 K = 0.10 的 Kuramoto 耦合让相邻点互相拉相位，回馈到
+     want0（+A·cosθ）。这才是"给第 8 维一个驱动"的正确形式 —— 前两版失败
+     是因为 ψ 没有自己的钟，只能当 7 维的被动投影。
+     结果：装得上、且三档 PR 全是 6.89–6.91±0.0x（对 7 维零损伤，这本身
+     是个正面结论 —— 新增维度不会挤占原有自由度）。但**没有任何可测收益**：
+       · A = 0.045、活 100%  → ξ(26 s 平均) 0.022±0.021
+       · A = 0（基线，同装置）→ ξ(26 s 平均) 0.025±0.022
+       · A = 0.06 / 0.10     → 活 96.6–96.8%，ξ 瞬时读数在 0.003–0.069 乱跳
+     瞬时 ξ 那个 0.069 是单帧偶然：ξ 以前一直是瞬时读数、不进时间平均，
+     这正是多轮改动"数字总在跳、单帧不可比"的根源之一。把 ξ 加进 26 s
+     平均之后立刻看清：没有提升。
+     结论：在这个系统里，第 8 维可以存在，但它的自由度被 7 维的正交性
+     完全占满了 —— PR 6.91/7 没有余量，多出来的振荡子场只能浮在表面。 */
+  /* ── 第 8 维 ψ：位置慢积分 → 同时驱动坐标（第 2–6 维）与能量（e）──────
+     源 = x₀/L₀（平滑位置标量）→ τ≈0.6 s 一阶积分 → 0.25/帧邻域扩散 ⇒
+     ψ 是位置的**低通滤波**。然后双向回馈：
+       · 坐标：sin(2π·ψ) 以 0.050 叠加进第 2–6 维驱动（各带 72° 偏移）
+       · 能量：sin(2π·ψ) 以 0.080 加进 want0
+     坐标那一路已实测（26 s 平均）：C₀ 0.222→0.237–0.253（+7~14%）、
+     ξ 0.019→0.025–0.035（+32~84%）、PR 6.90→6.66（−3.5%）。
+     现在补上能量那一路，让 ψ 成为同时管坐标与能量的调度层。
+     ── 能量路幅度扫描（坐标路固定 0.050，26 s 时间平均）：
+        0（只驱动坐标）→ PR 6.66±0.04 · C₀ 0.237±0.076 · 加 e 5.67±0.04
+        0.080         → PR 6.63±0.05 · C₀ 0.264±0.063
+        0.140         → PR 6.65±0.05 · C₀ 0.289±0.056
+        0.200         → PR 6.63±0.05 · C₀ 0.305±0.056
+        0.280         → PR 6.58±0.07 · C₀ 0.343±0.066 · 加 e 5.60±0.07   ← 定稿
+        0.360         → PR 6.56±0.06 · C₀ 0.382±0.069 · 加 e 5.57 · 活 100%
+        0.440         → PR 6.52±0.08 · C₀ 0.413±0.075 · 加 e 5.54 · 活 99.9%
+        0.560         → PR 6.47±0.08 · C₀ 0.462±0.085 · 加 e 5.50 · 活 99.0%
+     C₀ 一路翻倍（0.222→0.462），但**加 e 一路下行（5.91→5.50）** —— 这点相干
+     不是 e 自己变出来的，是 ψ 把 e 与坐标锁到同一相位、二者共线后合并出来的。
+     再往上（0.44/0.56）还要靠活 99.9%/99.0% 去换，又落回"分化与活性同一个旋钮"。
+     所以停在 0.280：C₀ +54%（0.343）、活 100%，代价 PR −0.32、加 e −0.31。
+     通道确实通了，但它买到的是"坐标与能量的相位锁定"，不是"能量有了自己的
+     空间结构"。 */
+  float psiN = cnt > 0.0 ? rsum / cnt : pa.w;   /* ψ 的邻域平均 */
+  float psi = pa.w;
+  psi += ((p0.x / uL0) - psi) * 0.020;          /* 慢积分：跟随平滑位置 */
+  psi += (psiN - psi) * 0.25;                   /* 扩散：抹掉单点抖动 */
+  /* ── 第 8 维"临时撑开"：只在 ψ 相位峰处开一个移动窗口 ────────────────
+     openPsi = clamp(sin(2π·ψ), 0, 1)，半波、占空比 50%。ψ 在空间上有相位梯度，
+     所以这个"开"的窗口不是全场同时亮，而是一道随位置移动的软通道。
+     它只是通道的开关，具体撑开什么由下面 k0 与速度项决定。 */
+  float openPsi = clamp(sin(6.2831853 * psi), 0.0, 1.0);
+  /* ── 第 7 维 m 的反向通道：第一次让 m 去读（而不是只写）─────────────
+     m 一直只写不读，这是 R²(5坐标→m)=0.0015 的结构原因。这里给它一条出口：
+     取 m 的**局部梯度**（自己减邻居均值），因为绝对 m 无界（实测 max 4.311），
+     直接用会把力炸掉；梯度是相对量、且 m 的时间常数 4.0 s 让这个差本身是
+     时间平滑过的，所以噪声比 e 的邻域差低得多（e 那边三次撞墙正是因为差分里
+     一半是随机的）。
+     tanh(4·Δm) 把 0.3 量级的差压进 ±0.9，再去推 e 的搬运目标。
+     ── 幅度扫描（26 s 时间平均；坐标路 0.050 + 能量路 0.280 固定）：
+        0.060 → PR 6.57±0.07 · C₀ 0.351±0.070 · 加 e 5.58 · σ(m) 0.261
+        0.150 → PR 6.56±0.07 · C₀ 0.359±0.067 · 加 e 5.57 · σ(m) 0.301
+        0.280 → PR 6.55±0.08 · C₀ 0.372±0.065 · 加 e 5.57 · σ(m) 0.270  ← 定稿
+        0.440 → PR 6.55±0.08 · C₀ 0.365±0.067 · 加 e 5.56 · σ(m) 0.267（回落）
+     额外拿到的东西：σ(m) 从无反馈时的 0.287 掉到 0.261–0.301、⟨|dm/dt|⟩ 从 0.040
+     掉到 0.038–0.039 —— 反馈在给 m 的无界增长加阻尼（它本来 max 能跑到 4.311、
+     没有 clamp，长跑有发散风险），这是顺手修掉的一个隐患。
+     但它和前面几条一样：C₀ 上去是靠 m 与 e 锁相，加 e 并没有升（5.91→5.57）。
+     结构上的意义大于统计上的 —— m 第一次真的被读，不再是"只写不读"的死端。 */
+  vec4 hb0 = texelFetch(uH, uv, 0);
+  float mSelf = hb0.x;
+  float mN = cnt > 0.0 ? hsum / cnt : mSelf;
+  float mGrad = tanh(4.0 * (mSelf - mN));
+  float want0 = clamp(0.5 - 0.5 * uCC + bias + 0.12 * smOld + 0.280 * sin(6.2831853 * psi) + 0.280 * mGrad, 0.0, 1.0);
+  /* ── 8 维可寻址写（uWE[16]）：直接改"那个相位箱的目标状态" ──────────────
+     ψ∈[0,1) 均分 16 箱，每个箱一个独立偏置。写第 k 箱 = 只改这 1/16 的点的 want0。
+     为什么挂 want0 而不挂 plantGain：plantGain 是源项，会被 burn 阈值吃掉
+     （实测全局写 0.50 只让 ⟨e⟩ 升 0.02）；want0 是 e 的吸附目标，改它 e 直接跟着走。
+     这是"写"最像记忆的地方 —— 不是灌能量，是把某个相位上的目标状态改掉。
+
+     【地址轴必须与读一致】读（phAcc/phDecAcc）是按全局 CLK 分 16 箱，
+     所以写也必须按 CLK 分箱。曾经用过每点的 psi —— 那是半径推出来的慢变量，
+     与 CLK 不是同一个坐标系，结果"写第 9 箱"会让 16 个箱一起变（串扰），
+     因为写的是半径层、量的是时间相位。传 uClkPh 进来就对齐了。 */
+  int wbin = int(clamp(floor(uClkPh * 16.0), 0.0, 15.0));
+  want0 = clamp(want0 + uWE[wbin], 0.0, 1.0);
+  float pool = e + sc;                               /* 两维总能量：搬运前后守恒 */
+
+  /* ── 第 8 维 ψ（7 维慢积分器）实测记录，已回退 ───────────────────────
+     构造：ψ 存 pa.w，τ≈4.2 s（比坐标 3.12 s / e 0.32 s / m 4.0 s 都慢），
+     驱动 = 0.5(1−e) + 0.5·near0（7 维里仅有的两个带空间结构的量），
+     再局部扩散（0.12）摊成长波，回馈到搬运速率 k0。
+     PR 一分不掉（6.91/6.90/6.91 三档都是 ±0.03），说明**新增维度本身不伤
+     原有 7 维** —— 这是这条路的正面结论。
+     但它没有涌现出结构：
+       · 幅度 0.45、下限 0.35 → C₀ 0.289±0.078（基线 0.232），
+         代价是活 96.7%、⟨e⟩ 0.764、sc 1.343 —— 靠把 3.3% 的点饿死换来分化
+       · 幅度 0.28、下限 0.55 → 活 100%，C₀ 0.223（回基线）
+       · 幅度 0.42、下限 0.72 → 活 100%，C₀ 0.220（回基线）
+     机理：驱动源 (1−e) 与 near0 本身的空间结构就浅（C₀ 只有 0.23），
+     慢积分只是把它原样存下来，没有放大能力 —— 要放大必须非线性，而任何
+     非线性放大都会先放大最弱的点（那些 e→0 的点），于是变成死亡。
+     结论：第 8 维装得上、不伤 7 维，但按这个驱动源拿不到"涌现"，
+     它的唯一收益（空间分化）与活性是同一个旋钮的两端。 */
+
+  float k0 = uAbs * (0.25 + 0.75 * near0) * 8.0 * uDT
+           * (0.35 + 1.30 * clamp(0.5 + 0.5 * sin(6.2831853 * (vb.z * 1.2)), 0.0, 1.0))
+           * (1.0 + uIn * 0.85 * win)
+           * clamp(1.0 + 0.40 * smOld, 0.45, 1.55)
+           * (1.0 + 1.20 * openPsi);   /* 通道内局部撑开：搬运系数临时放大 60% */
+  sc += (want0 * pool - sc) * k0;
+  e = clamp(pool - sc, 0.0, 1.0);
+  sc = clamp(sc, 0.0, 2.0);
+  /* ── 能量惯性输运（二阶）实测记录，已回退 ──────────────────────────
+     想法：一阶扩散 e += (eNb−e)·k 只会抹平，ξ 永远只有 0.006；改成
+     二阶（flux 先累积、再推动 e）应当让差异以波传出去，长程结构就出来了。
+     两档实测全部失败：
+       · flux×0.88 + 0.35Δ，e += flux        → 能量整体被推到边界，
+         ⟨e⟩ 0.995±0.000、C₀ 0.005、ξ 0.000（全饱和，差异被 clamp 吃掉）
+       · flux×0.75 + 0.25Δ，e += flux×0.30  → PR 5.86±0.26（基线 6.91±0.02），
+         掉 1.05 且波动 ±0.26 —— 这是混沌的特征，C₀ 0.175±0.113 同步劣化。
+     根因：e 被 clamp 在 [0,1] 硬边界上。带惯性的流量撞到边界会产生
+     吸收/反射，既不能出界也不能泄压，于是系统在边界上反复撞击 → 混沌。
+     要让能量"流动"，必须先给它一个不受 clamp 约束的容量（sc 也有 0..2
+     的边界，同样不行）。这需要在能量维之外再开一条无界的储量通道。 */
+
+  if (lvl < 0.35) lvl = 4.95;                        /* 沉到底后复位上行，闭环 */
+  /* 电磁导流：邻居能量按层级权重导进来（低 lvl 的节点更容易被灌满） */
+  e += (eNb - e) * uEM * (0.35 + 0.65 * clamp(lvl / 5.0, 0.0, 1.0)) * uDT;
+  e = clamp(e, 0.0, 1.0);
+
+  /* ── 无界储量 + 惯性输运实测记录，已回退 ────────────────────────────
+     把 e 的盈余搬进一个不设上下限的储量 u（存 pa.w），让 u 承担惯性与
+     扩散、e 只从它取一小份。三档结果：
+       · 反哺 tanh(uRes)          → 局部正反馈，C₀ 0.232→0.045→0.029
+       · 反哺 (uRes−uNb) 梯度      → C₀ −0.005±0.094（归零），PR 6.91 保住，
+                                    加 e 5.94±0.02、加 m 5.97±0.01 还各升一点
+     最后一档最有意思：PR 一分不掉、加 e 甚至更高 —— 但那是假的。注入源
+     (e − eNb) 是**邻域差**，而 K=4 的邻居集在相邻两点之间只有一半重合，
+     差分里一半是随机成分，于是 e 被噪声化：独立的方差上去了（PR 不动、
+     加 e 上升），空间连贯性归零（C₀ 崩）。
+     这是第三次撞同一面墙（前两次是裸坐标 k0、单跳应变）。结论：这个系统
+     里**只有一条长程通道**（平滑场 smOld，读邻居的 G.z），因为任意局域
+     差分都不相干。想要第二条，必须先让邻居更远或会换 —— 即拓扑重构。 */
+
+  /* 体积弹簧已删除：只靠邻居弹簧与四力维持形状 */
+
+  /* π 相位驱动 */
+  acc0.x += uDrv * (sp * 1.0 + cp * 0.0);
+  acc0.y += uDrv * (sp * 0.30902 + cp * 0.95106) + uDrv * 0.050 * sin(6.2831853 * psi + 1.2566371);
+  acc0.z += uDrv * (sp * -0.80902 + cp * 0.58779) + uDrv * 0.050 * sin(6.2831853 * psi + 2.5132741);
+  acc1.x += uDrv * (sp * -0.80902 + cp * -0.58779) + uDrv * 0.050 * sin(6.2831853 * psi + 3.7699112);
+  acc1.y += uDrv * (sp * 0.30902 + cp * -0.95106) + uDrv * 0.050 * sin(6.2831853 * psi + 5.0265482);
+  /* ── 通道内的跨维试验：只在撑开的窗口里，允许能量的局部差推物理位置 ──
+     e→坐标这条通道此前六次全部失败（裸坐标、单跳应变、弹簧刚度、PBD、二阶
+     惯性、无界储量），共同的死因是"全局接通"：一旦让 e 无条件驱动坐标，五维
+     立刻与 e 共线、PR 掉 1 以上。这里换个问法：如果只在一个**瞬时窗口**里接通
+     （openPsi > 0.5 的那半个相位），维度共线能不能被限制在窗口内、平均下来
+     不影响全局？
+     ── 实测（26 s 时间平均；撑开系数 / 本项系数 → 结果）：
+        0 / 0（无通道）→ PR 6.50 · 坐标5 4.70 · 加 e 5.58 · 加 m 5.62 · C₀ 0.370±0.069 · R² 0.0326
+        0.6 / 2.0      → PR 6.48 · 坐标5 4.74 · 加 e 5.59 · 加 m 5.65 · C₀ 0.436±0.085
+        1.2 / 3.5      → PR 6.46 · 坐标5 4.77 · 加 e 5.59 · 加 m 5.66 · C₀ 0.484±0.099
+                         · 活 100% @55s · R² 0.0264  ← 定稿
+        2.0 / 5.0      → PR 6.43 · 坐标5 4.77 · 加 e 5.56 · 加 m 5.65 · C₀ 0.510±0.110
+                         但 55 s 时活性就掉到 99.1%，否决
+        3.2 / 8.0      → PR 6.49 · 坐标5 4.83 · 加 e 5.61 · 加 m 5.72 · C₀ 0.555±0.140
+                         · 活 99.9% @55s · R² 0.1238 ←环最紧的一档
+        5.0 / 14.0     → PR 6.44 · 坐标5 4.84 · 加 e 5.61 · 加 m 5.68 · C₀ 0.549±0.162（回落）
+     **这次不是共线造假**：加 e 没掉（5.59–5.61）、坐标5 从 4.70 升到 4.77–4.84，
+     而 C₀ 涨到 0.48–0.56，相干发生在**近邻层**，全局五维没有塌。这是六次失败
+     以来 e→坐标第一次既接上又不打碎别的东西。
+     闭环强度随增益单调上升：R²([x0..x4]→e) 0.0264（1.2）→ 0.1238（3.2，涨 4.7 倍）。
+     但**环越紧，能量漏得越快** —— 3.2 档 CSV 里 ev mean 掉到 0.702（1.2 档是 0.919），
+     能量沿 e→坐标这条单向边被抽去推位置，位置不回馈能量。
+     ── 时长对照（同配置只改运行时长，两次独立实测）：
+        55 s → 活性 99.9%（3.2 档） / 100%（1.2 档）
+        60 s → 活性 87.9%（3.2 档） / 92.9%（1.2 档）
+     两档都掉，且 ⟨e⟩ 从 0.89 跌到 0.72 —— 说明这**不是增益的错，是时长**：系统
+     跑到 ~55 s 后开始集体的能量流失（burn 按阈值作用，e 一低烧得更狠）。
+     定稿取 1.2/3.5：C₀ 0.484（基线 0.370，+31%）、坐标5 4.77、55 s 活 100%、
+     60 s 活 92.9%（衰减最轻）。要更紧的环，把这两个数改成 3.2 / 8.0 即可。 */
+  acc0.x += (e - eNb) * uDrv * 3.5 * openPsi;
+  /* ── "在第 2–6 维写空间驱动"：三档实测，全部回退 ────────────────────
+     想法：x₀ 的驱动用出生相位 sp/cp，x₁–x₄ 只是方向权重不同，所以五维是
+     一个自由度复制五份（sd 0.0700–0.0740、v sd 0.0391–0.0403，差 5.7%）。
+     把 2–6 维的驱动相位换成"位置相位" bph = 2π·0.55·(x₀/L₀)，并给五维各
+     一个 72° 偏移 —— 让五个维各持同一张空间上的不同相位图案。
+       · 纯位置同源      → C₀ 0.296±0.076 · PR 5.59±0.11 · 坐标5 3.79±0.08
+       · 交叉源（各读不同维坐标，避免自驱）→ C₀ 0.214±0.090 · PR 5.24±0.05
+                                       · 坐标5 3.43±0.04（各维互相拖成闭环，最差）
+       · 混合 55% 位置 + 45% 出生 → C₀ 0.259±0.075 · PR 5.81±0.05 · 坐标5 3.95±0.04
+     基线（不动驱动）：C₀ 0.222±0.078 · PR 6.90±0.02 · 坐标5 4.94±0.01
+     结论：**"空间驱动"是把维数换成空间相干**，而且换率极差 —— 每牺牲 1.0 个
+     PR 最多换 0.074 的 C₀，三档都是单调权衡、没有拐点。根因和前面几次撞墙
+     同一条：K=4 的固定稀疏拓扑让"由位置导出的量"必然在五维间共享同一个源，
+     于是五维共线；一旦让它们读不同的源，就形成耦合闭环、塌得更狠。
+     所以这条通道真的封死了，回退到原驱动。 */
+
+  /* ── 最小化层半径 v2：对"到原点的径向距离"独立施加一条约束 ──────────
+     v1 试过把弹簧目标 L₀ 改成档位 —— 完全无效，因为那条弹簧约束的是
+     **邻居之间的链长**，不是点到原点的半径。球半径由链长网络与拓扑决定，
+     改 L₀ 只能改网格密度，改不了球有多大，所以 r 分布一直单峰。
+     这一版直接约束 r 本身：每点按出生半径 vb.z 归入 3 档，被拉回自己那一层。
+     这是此前被删掉的层半径的最小化版本 —— 只做定位，不做呼吸、不做渗透。 */
+  float rSelf = sqrt(dot(p0, p0) + dot(p1, p1) + 1e-8);
+  /* 基数取 uL0（平均邻边长度）：三档 = 0.50/0.75/1.00 × uL0 ≈ 0.11/0.16/0.21。
+     试过放大到 0.96（球半径尺度）：径向力压不住弹簧，86% 的点反而被推到最外档，
+     PR 5.90→4.84 全线退步，已退回。 */
+  float rTgt = uL0 * (0.50 + 0.25 * float(int(clamp(vb.z / 0.96, 0.0, 0.999) * 3.0)));
+  float pull = uRad * (rTgt - rSelf) / max(rSelf, 1e-4);
+  acc0 += p0 * pull;
+  acc1 += p1 * pull;
+
+  /* 积分 */
+  v0 = (v0 + acc0 * uDT) * uDamp;
+  v1 = (v1 + acc1 * uDT) * uDamp;
+  v0 = clamp(v0, vec3(-0.6), vec3(0.6));
+  v1 = clamp(v1, vec2(-0.6), vec2(0.6));
+
+  p0 += v0 * uDT;
+  p1 += v1 * uDT;
+
+  /* ── 弹簧改位置投影（PBD）实测记录，已回退 ──────────────────────────
+     改成约束投影后结构确实保住了：活 99.6–100%、C₀ 0.236–0.239（基线 0.228）、
+     没有膨胀没有坍缩。但四项统计一致掉 0.06–0.08：
+       PR 6.83±0.05 / 坐标5 4.90±0.04 / 加e 5.84±0.05 / 加m 5.90±0.04
+       （基线 6.91±0.02 / 4.97±0.01 / 5.92±0.02 / 5.96±0.01）
+     然后再把约束乘子 ⟨r−L₀⟩ 存进 pa.w 喂给 want0，想建第二条反向通道：
+     R²(5坐标→e) 从 0.027 掉到 0.0217，什么都没建起来。
+     原因是投影每帧把偏差压回 0 —— 约束越硬，应变越小，越像常数；
+     约束越软就越退回胡克力。这是个死结。
+     真正的瓶颈不在弹簧的实现方式，在**拓扑固定**：邻居永远是那 4 个，
+     于是"位置"和"距离"是同一件事，而距离必被弹簧/约束管着。要让位置
+     信息独立出来，只能让邻居会换（拓扑重构），那是另一个量级的改动。 */
+
+  /* 内层立方体（14 号的核心实验）：把整个系统压进中心边长为 uBox 的 5 维小立方体。
+     uBox=2.0 时不生效；调到 0.6 / 0.3 / 0.1 就是逐级收紧内层，看约束在哪一档失效。 */
+  if (uBox > 0.02) {
+    float hl = uBox * 0.5;
+    if (abs(p0.x) > hl) { p0.x = sign(p0.x) * hl; v0.x *= -0.50; }
+    if (abs(p0.y) > hl) { p0.y = sign(p0.y) * hl; v0.y *= -0.50; }
+    if (abs(p0.z) > hl) { p0.z = sign(p0.z) * hl; v0.z *= -0.50; }
+    if (abs(p1.x) > hl) { p1.x = sign(p1.x) * hl; v1.x *= -0.50; }
+    if (abs(p1.y) > hl) { p1.y = sign(p1.y) * hl; v1.y *= -0.50; }
+  }
+
+  /* 边界：越过球壳就缩回 */
+  float nr = sqrt(dot(p0, p0) + dot(p1, p1));
+  if (nr > uRmax) {
+    float s = uRmax / nr;
+    p0 *= s;
+    p1 *= s;
+    v0 *= 0.80;
+    v1 *= 0.80;
+  }
+
+  oPA = vec4(p0, psi);
+  oPB = vec4(p1, sd, cs);
+  oVA = vec4(v0, e);
+  oVB = vec4(v1, r0b, role);
+  /* 活着就继续长岁数，饿死则归零（遗体在场里留下养分，这一轮生命结束） */
+  oG = vec4(gene, e > 0.05 ? gt.y + uDT : 0.0, smNew, sc);
+
+  /* upper-layer memory: leaky time integral of local contrast plus neighbour memory.
+     Neighbour memory is read here only; it never feeds back into the physics.
+     旧版 driveM 里有一项 (cid − 3.5) * 0.060，而 cid 是"离哪个中心最近"，
+     纯由空间位置决定 —— 等于把坐标灌进记忆，实测 corr(m,x₀) = −0.63，
+     记忆被位置锚死，PR 去掉 m 反而更高。改成记"本点相对邻域的能量偏离"。 */
+  float inh = cnt > 0.0 ? hsum / cnt : ht.x;
+  /* 权重比（本轮实测定的）：输入项 0.50 vs 局部项 0.30。
+     0.05 / 1.2 那组测出来的 lag 曲线是 0.345 → 0.114 → −0.225，
+     一步就崩。原因不是 m 没有积分，而是 uIn 的稳态贡献只有
+     0.05/mLeak ≈ 0.2，被 (e−eNb)*1.2 的局部涨落（σ≈0.1 → 0.48）压住，
+     lag0 那 0.35 只是"当前这一个 uIn"在两边共享的成分，不是历史。
+     把输入项提到主导后，m 才能真正成为输入的漏积分器。 */
+  float driveM = (e - eNb) * 0.30 + (inh - ht.x) * uMix;
+  /* ── 输入直通慢状态（本轮新增，P0 重做）───────────────────────────
+     为什么走 m 而不是 want0：want0 被 clamp[0,1] 削顶，加偏置只会饱和
+     （此前 0.16 / 0.32 / 0.45 三档全部失败）。m 没有上界，且 τ≈4 s 由系统
+     自己的 mLeak / uMem 决定 —— 输入撤掉后痕迹按 4 s 衰减。这才是"系统的
+     记忆"，不是"输入信号自带的低通"（后者 τ=5 s 由 inSlow 决定）。 */
+  driveM += uIn * 0.50;
+  /* ── 第 8 维与 m 的耦合：两版，方向相反 ──────────────────────────────
+     [A · 稳定] mTarget = 0.30·sin(2π·ψ)，用一阶项把 m 拉向它。系数扫描
+       （26 s 时间平均）：0 → PR 6.56 / 加 m 5.68 / σ(m) 0.278；
+       0.10 → 6.51 / 5.63 / 0.213；0.30 → 6.18 / 5.33 / 0.161；
+       1.00 → 5.70 / 4.93 / 0.172（m 成了 ψ 的影子）。
+       结论：m 的"稳定"与"独立"是同一个旋钮 —— 一上锚就压住 σ(m) 与无界长尾
+       （max 4.311），但"加 m"同步崩塌。m 的无界恰恰是它自由的证据。
+       量纲坑：driveM 之后还要乘 uMem*uDT 再缩 80 倍，写 uDT/0.5 时每帧只动
+       7.8e-6、σ(m) 纹丝不动 —— 系数必须给到 1.0 量级。
+     [B · 驻留带，当前采用] 不给 m 任何外部目标，只让 ψ 调制它的**寿命**：
+       mLeak = uLeak·(1 + 0.80·sin(2π·ψ)) ∈ [0.05, 0.45]（均值仍 0.25）。
+       m 仍由原来那条 (e−eNb) 驱动，只是 ψ 高处衰减慢、ψ 低处衰减快。
+       系数 0.80 保证 leak 恒正（最小 0.05），不会出现负衰减发散。
+       实测（26 s 平均）：PR 6.56±0.07 · 加 m 5.68±0.04 · σ(m) 0.276 ·
+       max 5.295 · C₀ 0.367±0.066 —— 相对无锚基线零损失、"加 m"全部回血。
+       但导出 CSV 复核：R²([x0..x4] → m) = 0.0008，m 仍是纯时间积分，
+       驻留带**没有**给它造出可被坐标解释的空间结构。
+       同一份快照里 R²([x0..x4] → e) = 0.1027（早期只有 0.0159）、
+       corr(x0, e) = −0.316 —— e 的空间结构是 ψ 的能量路挣出来的，与本版无关。 */
+  /* ── 空间绑定尝试：把 ψ 当成 m 的**驱动源**（不是目标、不是寿命）────────
+     上面两版都没让 m 拿到空间结构（R²[坐标→m] 从 0.0008 没动过）。原因：
+     目标项是把 m 压向 ψ（压平，丢掉自由度）；寿命项只改衰减速度，不改 m 值
+     本身，所以 m 的值仍只由 (e−eNb) 这个近乎随机的差分决定。
+     这一版改注入：driveM 直接加一项 ψ 的相位波。ψ 是 x₀ 的慢积分、在空间上
+     有相位梯度，于是 m 会被这个源持续推着沿相位累积，而不被强制收敛到某个值。
+     幅度按 driveM 现有量级定：(e−eNb)*1.2 里 e−eNb 约 0.05 → 0.06 量级，
+     所以 0.25 会明确主导，但仍受 mLeak 的 0.25 阻尼约束。
+     ── 幅度扫描 + CSV 复核（26 s 时间平均；R² 用 5 坐标线性回归到 m）：
+        0.03 → PR 6.51±0.08 · 加 m 5.62±0.05 · σ(m) 0.302 · R² 0.0169  ← 定稿
+        0.08 → PR 6.14±0.10 · 加 m 5.30±0.06 · σ(m) 0.355 · R² 0.1398
+        0.25 → PR 5.84±0.12 · 加 m 5.05±0.09 · σ(m) 0.744 · ⟨m⟩ −0.169
+        无注入 → PR 6.56±0.07 · 加 m 5.68±0.04 · σ(m) 0.284 · R² 0.0008
+     **这是本项目第一次让 m 真正拿到空间结构**：R² 从 0.0008（等于零）一路涨到
+     0.1398（14%），最大跨维相关从 corr(x0,e) 变成 corr(x2,m) = −0.278。至此
+     "m 与坐标无关"这个卡了十几轮的墙被推倒一角 —— 方式是拿 ψ（x₀ 的慢积分）当
+     m 的驱动源灌进去，让记忆沿空间相位累积，而不是被压向某个目标值。
+     代价同样清楚：绑定强度与独立性反向。R² 0.14 时"加 m"掉 0.38；R² 0.017 时
+     只掉 0.06。定稿取 0.03 —— 属"微绑定"（1.7%），PR 6.51 / 加 m 5.62 几乎无损。
+     要强绑定就把这一项改成 0.08，用 0.38 的独立性买 14% 的可解释性。 */
+  driveM += 0.03 * sin(6.2831853 * psi);
+  /* mLeak 固定 = uLeak（本轮定稿，关掉了原先的 ψ 调制）。
+     对照实验：原写法 mLeak = uLeak*(1+0.80*sin(2πψ))，τ 在 2.2–20 s 间周期性摆动。
+     关掉后（LEAK 0.07、64 阶）：
+        峰 R² 0.514 @ k23（5.75 s），第二峰 0.504 @ k59（14.75 s），lag64 仍 0.440
+        MC 20.3/65 · PR 6.35±0.09 · C₀ 0.484 · 加 m 5.56
+     开着时是 0.481 @ 5.75 s、MC 17.6。也就是说双峰不是 ψ 调制造出来的影子，
+     关掉反而全面变好（MC +2.7、峰 +0.03），所以定稿固定 τ。
+     双峰本身仍在：14.75 s 接近 m 的 τ = 1/(0.07/80)/60 ≈ 19 s 的量级，
+     两条延迟线（m 的 14 s 与 uS 的 5 s）互相卷积就会出两个峰 —— 这是多时间尺度
+     记忆的天然结构，不是伪迹。 */
+  float mLeak = uLeak;
+  float mNew = ht.x * (1.0 - mLeak * uDT) + driveM * uMem * uDT;
+  oH = vec4(mNew, (mNew - ht.x) / max(uDT, 1e-4), cid, lvl);
+
+  /* ── 每点预测器（本轮新增，v2 自回归版）──────────────────────────
+     第一版是按相位索引：e ≈ a0 + a1·cos(2πψ) + b1·sin(2πψ)。
+     实测输给了最笨的基准：
+        相位预测器  |δ| 0.090  R² −1.90
+        复制上一步  |δ| 0.063  R²  0.788   ← 什么都不学，只拿 16 帧前的 e
+     也就是说单点 e 的可预测性来自时间连续性，不来自 ψ。ψ 只解释得了空间平均
+     （全局 ⟨e⟩ 相位 R² 0.976、跨圈 δ 0.017），解释不了单点。
+     所以这里换成自回归：e ≈ w·e_prev + b，w 是"这个点对自身演化的把握程度"。
+     学习用 NLMS，归一化因子 e_prev²+1（常数项不归一，b 的步长天然更稳）。
+     uPredEta=0 时整块恒等，不改物理 —— 先只学不反馈。 */
+  float ePrev = va.w;
+  vec4 pv = texelFetch(uP, uv, 0);
+  float dpErr = e - (pv.x * ePrev + pv.y);
+  float dpNr = ePrev * ePrev + 1.0 + 1e-6;
+  if (uPredEta > 0.0) {
+    pv.x += uPredEta * dpErr * ePrev / dpNr;
+    pv.y += uPredEta * dpErr / dpNr;
+  }
+  pv.z = 0.0;
+  pv.w = dpErr;
+  oP = pv;
+}`;
+
+const FULL_VS = `#version 300 es
+in vec2 aV;
+void main() { gl_Position = vec4(aV, 0.0, 1.0); }`;
+
+/* ---------- 上层：只读索引。按 8 个中心的最近归属给每个点编 cid，不动物理 ---------- */
+const INDEX_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uPA;
+uniform sampler2D uPB;
+uniform vec4 uC0[8];
+uniform float uC4[8];
+uniform float uS[8];
+out vec4 oID;
+
+void main() {
+  ivec2 uv = ivec2(gl_FragCoord.xy);
+  vec4 pa = texelFetch(uPA, uv, 0);
+  vec4 pb = texelFetch(uPB, uv, 0);
+  float p0 = pa.x, p1 = pa.y, p2 = pa.z, p3 = pb.x, p4 = pb.y;
+  float best = 1e9;
+  float bi = 0.0;
+  for (int c = 0; c < 8; c++) {
+    vec4 c0 = uC0[c];
+    float d0 = p0 - c0.x, d1 = p1 - c0.y, d2 = p2 - c0.z, d3 = p3 - c0.w;
+    float d4 = p4 - uC4[c];
+    float d2v = d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4;
+    if (d2v < best) { best = d2v; bi = float(c); }
+  }
+  /* z 通道原来是空的：现在写条地址 rid = 把中心团按归属半径切成 8 档，
+     全局条号 = cid*8 + rid，共 64 条 */
+  float dist = sqrt(best);
+  int ic = int(bi);
+  oID = vec4(bi, dist, floor(clamp(dist * uS[ic], 0.0, 7.999)), 1.0);
+}`;
+
+const progPhys = mkProg(FULL_VS, PHYS_FS);
+const progIndex = mkProg(FULL_VS, INDEX_FS);
+const aVIndex = gl.getAttribLocation(progIndex, 'aV');
+
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+const aVPhys = gl.getAttribLocation(progPhys, 'aV');
+gl.enableVertexAttribArray(aVPhys);
+gl.vertexAttribPointer(aVPhys, 2, gl.FLOAT, false, 0, 0);
+
+/* ---------- 渲染 ---------- */
+const LINE_VS = `#version 300 es
+precision highp float;
+in float aIdx;
+uniform sampler2D uPA;
+uniform sampler2D uPB;
+uniform sampler2D uVA;
+uniform sampler2D uVB;
+uniform float uCay, uSay, uCax, uSax, uR, uIW, uIH, uSize;
+out float vK;
+out float vX;
+out float vE;
+out float vT;
+out float vM;
+out float vCid;
+void main() {
+  int i = int(aIdx);
+  ivec2 uv = ivec2(i % 100, i / 100);
+  vec4 pa = texelFetch(uPA, uv, 0);
+  vec4 pb = texelFetch(uPB, uv, 0);
+  vec4 va = texelFetch(uVA, uv, 0);
+  vec4 vt = texelFetch(uVB, uv, 0);
+
+  float X = pa.x, Y = pa.y, Z = pa.z;
+  float X1 = uCay * X + uSay * Z;
+  float Z1 = -uSay * X + uCay * Z;
+  float Y1 = uCax * Y - uSax * Z1;
+  float Z2 = uSax * Y + uCax * Z1;
+
+  float persp = 1.0 / (1.0 + 0.55 * (1.0 - Z2));
+  float px = uIW * 0.5 + X1 * uR * persp;
+  float py = uIH * 0.5 - Y1 * uR * persp;
+
+  gl_Position = vec4(px * 2.0 / uIW - 1.0, 1.0 - py * 2.0 / uIH, 0.0, 1.0);
+  gl_PointSize = 1.0;
+  float d = (Z2 + 1.0) * 0.5;
+  /* 连线是加性混合：16577 条线挤在球内平均叠 ~11 层，0.50 会让球心直接饱和成白。
+     压到 0.12，线只留结构、不再压过点。 */
+  vK = (0.10 + 0.20 * d) * 0.12 * (0.08 + 1.15 * va.w * va.w);
+  vX = (pb.y + 1.0) * 0.5;
+  vE = va.w;
+  vT = vt.w;
+  vM = 0.0;
+  vCid = -1.0;
+}`;
+
+const POINT_VS = `#version 300 es
+precision highp float;
+uniform sampler2D uPA;
+uniform sampler2D uPB;
+uniform sampler2D uVA;
+uniform sampler2D uVB;
+uniform sampler2D uIDX;
+uniform sampler2D uH;
+uniform float uCay, uSay, uCax, uSax, uR, uIW, uIH, uSize;
+out float vK;
+out float vX;
+out float vE;
+out float vT;
+out float vM;
+out float vCid;
+void main() {
+  int i = gl_VertexID;
+  ivec2 uv = ivec2(i % 100, i / 100);
+  vec4 pa = texelFetch(uPA, uv, 0);
+  vec4 pb = texelFetch(uPB, uv, 0);
+  vec4 va = texelFetch(uVA, uv, 0);
+  vec4 vt = texelFetch(uVB, uv, 0);
+  float mem = texelFetch(uH, uv, 0).x;
+
+  float X = pa.x, Y = pa.y, Z = pa.z;
+  float X1 = uCay * X + uSay * Z;
+  float Z1 = -uSay * X + uCay * Z;
+  float Y1 = uCax * Y - uSax * Z1;
+  float Z2 = uSax * Y + uCax * Z1;
+
+  float persp = 1.0 / (1.0 + 0.55 * (1.0 - Z2));
+  float px = uIW * 0.5 + X1 * uR * persp;
+  float py = uIH * 0.5 - Y1 * uR * persp;
+
+  gl_Position = vec4(px * 2.0 / uIW - 1.0, 1.0 - py * 2.0 / uIH, 0.0, 1.0);
+  gl_PointSize = (pb.x > 0.15 ? 2.2 : 1.3) * uSize;
+  float d = (Z2 + 1.0) * 0.5;
+  /* 这里 0.60 → 0.22：拍扁视图是加性混合（blendFunc ONE,ONE），中心叠几十层，
+     旧尺度（|p|≈1）时够用，L₀ 缩到 0.173 后密度涨 ~190 倍，0.60 会把球心糊成纯白 */
+  vK = (0.30 + 0.34 * d) * 0.22 * (0.10 + 1.10 * va.w * va.w);
+  vX = (pb.y + 1.0) * 0.5;
+  vE = va.w;
+  vT = vt.w;
+  vM = mem;
+  /* 上层给的中心号：8 个中心各占一段色相，画面上能直接看出分区 */
+  vCid = texelFetch(uIDX, uv, 0).r;
+}`;
+
+const REND_FS = `#version 300 es
+precision mediump float;
+in float vK;
+in float vX;
+in float vE;
+in float vT;
+in float vM;
+in float vCid;
+out vec4 o;
+void main() {
+  /* 型决定色相：植物=青绿，动物=琥珀。亮度由代谢量 e 决定，活体亮、死体暗 */
+  vec3 plantC = vec3(30.0, 205.0, 128.0) / 255.0;
+  vec3 animalC = vec3(255.0, 148.0, 38.0) / 255.0;
+  vec3 base = mix(plantC, animalC, vT);
+  vec3 c = base * vK * (1.0 + 0.75 * vT);
+  c += vec3(200.0, 60.0, 20.0) / 255.0 * vK * vX * 0.30;
+  c += vec3(255.0, 240.0, 190.0) / 255.0 * vK * 0.75 * vE * vE * vE;
+  /* 上层记忆：m 越高，点越偏冷蓝。这是上层被"读出来"的唯一可见证据 */
+  c = mix(c, c + vec3(70.0, 120.0, 255.0) / 255.0, clamp(vM * 0.55, 0.0, 1.0) * 0.60);
+  o = vec4(c, 1.0);
+}`;
+
+const progLine = mkProg(LINE_VS, REND_FS);
+const progPoint = mkProg(POINT_VS, REND_FS);
+
+/* ---------- 纯三维视图（只取 x₀x₁x₂ 三轴） ----------
+   默认画面是把 x₀x₁x₂ 正投影到屏幕、再叠一点轻微透视，本质仍是"拍扁"。
+   这一版换成真正的透视相机：相机距离固定、点大小按 1/z 缩放、深度雾把远近
+   压出层次 —— 只有这样才能从画面里真的读出"点在第三维的什么位置"。
+   只读 PA 的前三通道与 VA/VB/H，物理一侧一行不动。 */
+const P3D_VS = `#version 300 es
+precision highp float;
+uniform sampler2D uPA;
+uniform sampler2D uPB;
+uniform sampler2D uVA;
+uniform sampler2D uVB;
+uniform sampler2D uH;
+uniform float uCay, uSay, uCax, uSax, uR, uIW, uIH, uSize, uDist, uFoc;
+uniform vec3 uCen;
+out float vK;
+out float vE;
+out float vT;
+out float vM;
+out float vD;
+void main() {
+  int i = gl_VertexID;
+  ivec2 uv = ivec2(i % 100, i / 100);
+  vec4 pa = texelFetch(uPA, uv, 0);
+  vec4 pb = texelFetch(uPB, uv, 0);
+  vec4 va = texelFetch(uVA, uv, 0);
+  vec4 vt = texelFetch(uVB, uv, 0);
+  float mem = texelFetch(uH, uv, 0).x;
+
+  /* 只取前三维：x₀x₁x₂，并扣掉世界质心 —— 球本身在漂，相机钉在原点就会拍偏 */
+  float X = pa.x - uCen.x, Y = pa.y - uCen.y, Z = pa.z - uCen.z;
+  float X1 = uCay * X + uSay * Z;
+  float Z1 = -uSay * X + uCay * Z;
+  float Y1 = uCax * Y - uSax * Z1;
+  float Z2 = uSax * Y + uCax * Z1;
+
+  /* 透视：相机放在 Z2 = -uDist 处，焦距 uFoc（像素单位） */
+  float zc = uDist + Z2;
+  float s = uFoc / max(zc, 0.30);
+  float px = uIW * 0.5 + X1 * s;
+  float py = uIH * 0.5 - Y1 * s;
+
+  gl_Position = vec4(px * 2.0 / uIW - 1.0, 1.0 - py * 2.0 / uIH, 0.0, 1.0);
+  /* vD：0 = 最远，1 = 最近。深度雾与点大小都跟它走
+     zc 的实际跨度约 uDist±0.35，按这个跨度归一化，深度才有完整的 0→1 过渡 */
+  vD = clamp((zc - (uDist - 0.38)) / 0.76, 0.0, 1.0);
+  gl_PointSize = uSize * (1.20 + 1.10 * vD);
+  vK = (0.42 + 0.46 * vD) * 0.86 * (0.10 + 1.10 * va.w * va.w);
+  vE = va.w;
+  vT = vt.w;
+  vM = mem;
+}`;
+
+const P3D_FS = `#version 300 es
+precision mediump float;
+in float vK;
+in float vE;
+in float vT;
+in float vM;
+in float vD;
+out vec4 o;
+void main() {
+  /* 圆点 + 软边：方点在一万点的密度下会糊成噪声 */
+  vec2 d = gl_PointCoord - 0.5;
+  float r2 = dot(d, d);
+  if (r2 > 0.25) discard;
+  float soft = 1.0 - r2 * 3.2;
+
+  vec3 plantC = vec3(30.0, 205.0, 128.0) / 255.0;
+  vec3 animalC = vec3(255.0, 148.0, 38.0) / 255.0;
+  vec3 base = mix(plantC, animalC, vT);
+  vec3 c = base * vK * (1.0 + 0.75 * vT);
+  c += vec3(255.0, 240.0, 190.0) / 255.0 * vK * 0.75 * vE * vE * vE;
+  c = mix(c, c + vec3(70.0, 120.0, 255.0) / 255.0, clamp(vM * 0.55, 0.0, 1.0) * 0.60);
+  /* 深度雾：远端的点褪成深蓝，近端的点更亮 —— 第三维的深浅靠这个读出来 */
+  vec3 farC = vec3(0.04, 0.10, 0.22);
+  c = mix(farC * (0.30 + 0.55 * vE), c, 0.22 + 0.78 * vD);
+  o = vec4(c * soft, 1.0);
+}`;
+
+const progP3D = mkProg(P3D_VS, P3D_FS);
+
+/* 上层八个中心的方位标记：5 维里切的 8 个区投影到 3 维必然互相重叠，
+   所以不给节点染色（叠起来会混成一色），只把中心本身标出来 */
+const CENTER_VS = `#version 300 es
+precision highp float;
+in vec2 aP;
+uniform vec3 uCol[8];
+uniform float uSize;
+out vec3 vC;
+void main() {
+  gl_Position = vec4(aP, 0.0, 1.0);
+  gl_PointSize = 15.0 * uSize;
+  vC = uCol[int(gl_VertexID) % 8];
+}`;
+const CENTER_FS = `#version 300 es
+precision mediump float;
+in vec3 vC;
+out vec4 o;
+void main() {
+  vec2 d = gl_PointCoord * 2.0 - 1.0;
+  float a = exp(-dot(d, d) * 2.6);
+  o = vec4(vC * a * 2.2, 1.0);
+}`;
+const progCen = mkProg(CENTER_VS, CENTER_FS);
+const aPCen = gl.getAttribLocation(progCen, 'aP');
+const cenBuf = gl.createBuffer();
+const cenPts = new Float32Array(NCEN * 2);
+gl.bindBuffer(gl.ARRAY_BUFFER, cenBuf);
+gl.bufferData(gl.ARRAY_BUFFER, cenPts, gl.DYNAMIC_DRAW);
+const CCOL = new Float32Array([
+  1.0, 0.36, 0.26,  1.0, 0.76, 0.20,  0.86, 1.0, 0.26,  0.30, 1.0, 0.56,
+  0.26, 0.95, 0.95,  0.36, 0.62, 1.0,  0.66, 0.46, 1.0,  1.0, 0.42, 0.86
+]);
+
+const lineIdx = new Uint32Array(EDGE_N * 2);
+for (let e = 0; e < EDGE_N; e++) { lineIdx[e * 2] = edges[e * 2]; lineIdx[e * 2 + 1] = edges[e * 2 + 1]; }
+const idxBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, idxBuf);
+gl.bufferData(gl.ARRAY_BUFFER, lineIdx, gl.STATIC_DRAW);
+
+const aIdxLoc = gl.getAttribLocation(progLine, 'aIdx');
+
+/* 渲染 uniform 位置 */
+const U = {};
+function loc(p, n) { return gl.getUniformLocation(p, n); }
+/* GLSL 数组 uniform 的 location 必须用 "名字[0]"，否则返回 null、写入静默失效 */
+function locA(p, n) { return gl.getUniformLocation(p, n + '[0]') || gl.getUniformLocation(p, n); }
+U.phys = {};
+['uPA', 'uPB', 'uVA', 'uVB', 'uG', 'uH', 'uIDX', 'uNEI', 'uP', 'uL0', 'uStiff', 'uRep', 'uGr', 'uEl', 'uKs', 'uGa', 'uLam',
+ 'uDT', 'uDamp', 'uRmax', 'uDrv', 'uCC', 'uSC', 'uEat', 'uBurn', 'uLight', 'uBox', 'uMem', 'uLeak', 'uMix', 'uPredEta', 'uWrite', 'uWritePh', 'uIn', 'uQ', 'uEbar', 'uLV', 'uAbs', 'uEM', 'uLay', 'uRad'].forEach(n => { U.phys[n] = loc(progPhys, n); });
+U.phys.uWE = locA(progPhys, 'uWE');
+U.phys.uClkPh = loc(progPhys, 'uClkPh');
+/* 注意：新增 shader 的 uniform 必须在这里取位置，否则 uniform1f(null) 是个静默的空操作 */
+U.index = {};
+['uPA', 'uPB', 'uC0', 'uC4', 'uS'].forEach(function (n) { U.index[n] = loc(progIndex, n); });
+/* 每中心把"平均归属距"钉在第 4 档，条地址才不会全挤在最内档、外侧出现空条 */
+const sArr = new Float32Array(NCEN).fill(8.0);
+U.cen = { col: loc(progCen, 'uCol'), size: loc(progCen, 'uSize') };
+const c0v = new Float32Array(NCEN * 4), c4v = new Float32Array(NCEN);
+/* 节点震荡会给每个点不同相位的核力，净效应是一个缓慢的整体平移；
+   8 个中心若死钉在原点就会越漂越偏（实测成员 1194–1330 → 298–3088）。
+   所以中心跟着世界质心走：cenOff[] 每 16 帧由 CPU 更新，物理完全不动。 */
+const cenOff = new Float32Array(5);
+function rebuildCenters() {
+  for (let c = 0; c < NCEN; c++) {
+    c0v[c * 4] = CENTERS[c * 5] + cenOff[0]; c0v[c * 4 + 1] = CENTERS[c * 5 + 1] + cenOff[1];
+    c0v[c * 4 + 2] = CENTERS[c * 5 + 2] + cenOff[2]; c0v[c * 4 + 3] = CENTERS[c * 5 + 3] + cenOff[3];
+    c4v[c] = CENTERS[c * 5 + 4] + cenOff[4];
+  }
+}
+rebuildCenters();
+
+/* 7×7 对称阵的 Jacobi 特征值 —— 用来算参与比维数 PR=(Σλ)²/Σλ²
+   注意：必须复制入参。之前写 const B = A 是别名，调用方传进来的相关矩阵
+   会被原地旋转成对角阵，其后所有 prBlock 读到的都是残骸 —— 这就是
+   "x₀x₁x₂ 只有 2.38、坐标5 只有 4.34" 的来源（实测两者都该是满的）。 */
+function jacobiEig(n, A) {
+  const B = A.slice();
+  for (let sweep = 0; sweep < 30; sweep++) {
+    let off = 0;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) off += B[i * n + j] * B[i * n + j];
+    if (off < 1e-20) break;
+    for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) {
+      const apq = B[p * n + q];
+      if (Math.abs(apq) < 1e-22) continue;
+      const app = B[p * n + p], aqq = B[q * n + q];
+      const th = 0.5 * Math.atan2(2 * apq, aqq - app);
+      const c = Math.cos(th), s = Math.sin(th);
+      for (let k = 0; k < n; k++) {
+        const kp = B[k * n + p], kq = B[k * n + q];
+        B[k * n + p] = c * kp - s * kq;
+        B[k * n + q] = s * kp + c * kq;
+      }
+      for (let k = 0; k < n; k++) {
+        const pk = B[p * n + k], qk = B[q * n + k];
+        B[p * n + k] = c * pk - s * qk;
+        B[q * n + k] = s * pk + c * qk;
+      }
+    }
+  }
+  const d = new Float64Array(n);
+  for (let i = 0; i < n; i++) d[i] = B[i * n + i];
+  return d;
+}
+
+/* 有效维数：7 个量（x₀..x₄、代谢 e、记忆 m），各自标准化后求相关矩阵的参与比 */
+const PR7 = new Float32Array(NP * 7);
+const PR_COR = new Float64Array(49);
+const PR_MU = new Float64Array(7), PR_SD = new Float64Array(7);
+let statPR = 0, statPR5 = 0, statPR5e = 0, statPR5m = 0, statPRxyz = 0, statPRph = 0;
+let statCorrER = 0;
+U.line = {};
+U.pt = {};
+U.p3d = {};
+['uPA', 'uPB', 'uVA', 'uVB', 'uIDX', 'uH', 'uCay', 'uSay', 'uCax', 'uSax', 'uR', 'uIW', 'uIH', 'uSize'].forEach(n => {
+  U.line[n] = loc(progLine, n); U.pt[n] = loc(progPoint, n);
+});
+['uPA', 'uPB', 'uVA', 'uVB', 'uH', 'uCay', 'uSay', 'uCax', 'uSax', 'uIW', 'uIH', 'uSize', 'uDist', 'uFoc', 'uCen'].forEach(n => {
+  U.p3d[n] = loc(progP3D, n);
+});
+
+let iw = 1, ih = 1, DPR = 1;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(window.innerWidth * DPR);
+  cv.height = Math.round(window.innerHeight * DPR);
+  iw = cv.width; ih = cv.height;
+  gl.viewport(0, 0, iw, ih);
+}
+resize();
+window.addEventListener('resize', resize);
+
+/* 状态指针 */
+let cur = 0;  // 0: A 是当前, 1: B 是当前
+let CLK = 0;
+
+function bindTex(unit, tex) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+}
+
+function physPass() {
+  const src = cur === 0 ? TEX_A : TEX_B;
+  const dst = cur === 0 ? FBO_B : FBO_A;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst);
+  gl.viewport(0, 0, GRID, GRID);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progPhys);
+
+  bindTex(0, src[0]); bindTex(1, src[1]); bindTex(2, src[2]); bindTex(3, src[3]);
+  bindTex(4, TEX_NEI);
+  bindTex(6, src[4]);
+  bindTex(5, src[5]);
+  bindTex(7, TEX_IDX);
+  bindTex(8, src[6]);
+  gl.uniform1i(U.phys.uPA, 0); gl.uniform1i(U.phys.uPB, 1);
+  gl.uniform1i(U.phys.uVA, 2); gl.uniform1i(U.phys.uVB, 3);
+  gl.uniform1i(U.phys.uP, 8);
+  gl.uniform1i(U.phys.uNEI, 4); gl.uniform1i(U.phys.uG, 6);
+  gl.uniform1i(U.phys.uH, 5); gl.uniform1i(U.phys.uIDX, 7);
+  gl.uniform1f(U.phys.uMem, RL.MEM);
+  gl.uniform1f(U.phys.uLeak, RL.LEAK);
+  gl.uniform1f(U.phys.uMix, RL.HMIX);
+  gl.uniform1f(U.phys.uQ, RL.QW);
+  gl.uniform1f(U.phys.uLV, RL.LV);
+  gl.uniform1f(U.phys.uAbs, RL.ABS);
+  gl.uniform1f(U.phys.uEM, RL.EM);
+  gl.uniform1f(U.phys.uLay, RL.LAY);
+  gl.uniform1f(U.phys.uRad, RL.RAD);
+  gl.uniform1f(U.phys.uEbar, statE > 0 ? statE : 0.871);
+  gl.uniform1f(U.phys.uIn, IN_VAL);
+  gl.uniform1f(U.phys.uPredEta, PRED_ETA);
+  gl.uniform1f(U.phys.uWrite, WRITE_AMP);
+  gl.uniform1f(U.phys.uWritePh, WRITE_PH);
+  gl.uniform1fv(U.phys.uWE, WR_E);
+  gl.uniform1f(U.phys.uClkPh, ((CLK / 6.2831853) % 1.0 + 1.0) % 1.0);
+  if (!window.__inDbg) { window.__inDbg = 1; console.log('uInLoc=' + (U.phys.uIn ? 'ok' : 'NULL') + ' IN_VAL=' + IN_VAL); }
+
+  /* P0：相位钟的选择性推进。CLK 是"时间步"本身，对它做输入调制
+     等于让系统的时间流逝速率随输入变化 —— 输入在这里不是扰动，是参数。
+
+     ── 实测记录（96 步 / 32 s 一档，输入已低通 τ≈5 s）───────────────
+       INSEL 0.00 → MC 10.3/17 · lag0 R² 0.40 · PR 6.57±0.12 · 坐标5 4.84±0.06
+                    · C₀ 0.503±0.100 · ξ 0.017±0.011
+       INSEL 0.60 → MC 13.6/17 · lag0 R² 0.79 · PR 6.45±0.08 · 坐标5 4.76±0.03
+                    · C₀ 0.515±0.102 · ξ 0.025±0.016   ← 定稿档
+       INSEL 1.00 → MC 13.1/17 · lag0 R² 0.62 · PR 6.40±0.11 · 坐标5 4.72±0.03
+                    · C₀ 0.509±0.113 · ξ 0.026±0.014
+     1.00 回落说明这是有拐点的旋钮：调制过强会让 CLK 抖得比 e 的跟随还快。
+     对照（低通之前，输入 0.25 s 白噪声）：MC 只有 0.3–3.7/17、lag0 R² 0.00–0.15。
+     根因不是"状态不够"，是输入时间尺度比系统快 15 倍，被 3.74 s 相位钟
+     直接平均掉 —— 把输入降到 τ≈5 s 与系统同频，MC 自己就跳到 10.3；
+     再加相位调制到 13.6。这是本项目第一次让"记忆"成为可测量而不是受迫响应。 */
+  CLK += 0.028 * (1.0 + IN_VAL * RL.INSEL);
+  gl.uniform1f(U.phys.uL0, L0);
+  gl.uniform1f(U.phys.uStiff, RL.STIFF);
+  gl.uniform1f(U.phys.uRep, RL.REP);
+  gl.uniform1f(U.phys.uGr, RL.GR);
+  gl.uniform1f(U.phys.uEl, RL.EL);
+  gl.uniform1f(U.phys.uKs, RL.KS);
+  gl.uniform1f(U.phys.uGa, RL.GA);
+  gl.uniform1f(U.phys.uLam, RL.LAM);
+  gl.uniform1f(U.phys.uDT, RL.DT);
+  gl.uniform1f(U.phys.uDamp, RL.DAMP);
+  gl.uniform1f(U.phys.uRmax, RL.RMAX);
+  gl.uniform1f(U.phys.uDrv, RL.DRV);
+  gl.uniform1f(U.phys.uCC, Math.cos(CLK));
+  gl.uniform1f(U.phys.uSC, Math.sin(CLK));
+  gl.uniform1f(U.phys.uEat, RL.EAT);
+  gl.uniform1f(U.phys.uBurn, RL.BURN);
+  /* 光照是外部引擎，恒定 */
+  gl.uniform1f(U.phys.uLight, RL.LIGHT);
+  gl.uniform1f(U.phys.uBox, BOX);
+  gl.enableVertexAttribArray(aVPhys);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.vertexAttribPointer(aVPhys, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  cur = 1 - cur;
+}
+
+/* 上层推进：只读当前位置，写出 (cid, 距, rid, 1)。不写任何物理纹理 —— 这就是"零代价"的来源 */
+function indexPass() {
+  const src = cur === 0 ? TEX_A : TEX_B;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, IFBO);
+  gl.viewport(0, 0, GRID, GRID);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progIndex);
+  bindTex(0, src[0]); bindTex(1, src[1]);
+  gl.uniform1i(U.index.uPA, 0); gl.uniform1i(U.index.uPB, 1);
+  gl.uniform4fv(U.index.uC0, c0v);
+  gl.uniform1fv(U.index.uC4, c4v);
+  gl.uniform1fv(U.index.uS, sArr);
+  gl.enableVertexAttribArray(aVIndex);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.vertexAttribPointer(aVIndex, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+const readBuf = new Float32Array(NP * 4);
+const readBuf2 = new Float32Array(NP * 4);
+const readBufP = new Float32Array(NP * 4);
+const readBufQ = new Float32Array(NP * 4);
+const readBufG = new Float32Array(NP * 4);
+const readBufH = new Float32Array(NP * 4);
+const readBufI = new Float32Array(NP * 4);
+const readBufPe = new Float32Array(NP * 4);
+/* 单点对照：把上一次统计帧的 e 存下来，直接拿它预测这一帧。
+   这是"什么都不学、只复制上一步"的基准 —— 每点相位预测器必须打败它才算有用。 */
+const prevEStat = new Float32Array(NP);
+
+function render(now) {
+  const t = now / 1000;
+  const src = cur === 0 ? TEX_A : TEX_B;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, iw, ih);
+  gl.enable(gl.BLEND);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  /* 纯三维视图（按 V 切换）：只取 x₀x₁x₂ 三轴，真透视相机 + 深度雾。
+     默认视图是把三维正投影拍扁、再叠一点轻微透视，第三维的深浅读不出来。 */
+  if (VIEW3) {
+    const ay3 = t * 0.22, ax3 = t * 0.12;
+    const c1 = Math.cos(ay3), s1 = Math.sin(ay3);
+    const c2 = Math.cos(ax3), s2 = Math.sin(ax3);
+    gl.useProgram(progP3D);
+    bindTex(0, src[0]); bindTex(1, src[1]); bindTex(2, src[2]); bindTex(3, src[3]);
+    bindTex(4, src[5]);
+    gl.uniform1i(U.p3d.uPA, 0); gl.uniform1i(U.p3d.uPB, 1);
+    gl.uniform1i(U.p3d.uVA, 2); gl.uniform1i(U.p3d.uVB, 3); gl.uniform1i(U.p3d.uH, 4);
+    gl.uniform1f(U.p3d.uCay, c1); gl.uniform1f(U.p3d.uSay, s1);
+    gl.uniform1f(U.p3d.uCax, c2); gl.uniform1f(U.p3d.uSax, s2);
+    gl.uniform1f(U.p3d.uIW, iw); gl.uniform1f(U.p3d.uIH, ih);
+    gl.uniform1f(U.p3d.uSize, DPR);
+    gl.uniform3f(U.p3d.uCen, cenOff[0], cenOff[1], cenOff[2]);
+    /* statR 是平均半径，最大半径约是它的 1.8 倍；按最大半径取景，球才不会被裁到屏外 */
+    const Rw = Math.max(statR * 1.8, 0.10);
+    const DD = 1.9;
+    gl.uniform1f(U.p3d.uDist, DD);
+    gl.uniform1f(U.p3d.uFoc, Math.min(iw, ih) * 0.42 * DD / Rw);
+    gl.drawArrays(gl.POINTS, 0, NP);
+    return;
+  }
+
+  const ay = t * 0.32, ax = t * 0.19;
+  const cay = Math.cos(ay), say = Math.sin(ay);
+  const cax = Math.cos(ax), sax = Math.sin(ax);
+  /* 取景按实际半径来。原来这里写死 R = 0.46*min(iw,ih)，
+     是给旧版 |p|≈1 的球用的；L₀ 缩到 0.173 后同一比例只把球画成 45 px 一团。
+     与三维视图同一取景半径，但拍扁视图没有深度衰减、点全叠在一层，
+     所以取景再放宽一档（0.42→0.62），密度降下来才不会过曝成白团。 */
+  const R = Math.min(iw, ih) * 0.72 / Math.max(statR * 1.8, 0.10);
+
+  /* 线 */
+  gl.useProgram(progLine);
+  bindTex(0, src[0]); bindTex(1, src[1]); bindTex(2, src[2]); bindTex(3, src[3]);
+  gl.uniform1i(U.line.uPA, 0); gl.uniform1i(U.line.uPB, 1); gl.uniform1i(U.line.uVA, 2); gl.uniform1i(U.line.uVB, 3);
+  gl.uniform1f(U.line.uCay, cay); gl.uniform1f(U.line.uSay, say);
+  gl.uniform1f(U.line.uCax, cax); gl.uniform1f(U.line.uSax, sax);
+  gl.uniform1f(U.line.uR, R); gl.uniform1f(U.line.uIW, iw);
+  gl.uniform1f(U.line.uIH, ih); gl.uniform1f(U.line.uSize, DPR);
+  gl.enableVertexAttribArray(aIdxLoc);
+  gl.bindBuffer(gl.ARRAY_BUFFER, idxBuf);
+  gl.vertexAttribPointer(aIdxLoc, 1, gl.UNSIGNED_INT, false, 0, 0);
+  gl.drawArrays(gl.LINES, 0, EDGE_N * 2);
+
+  /* 点 */
+  gl.useProgram(progPoint);
+  bindTex(0, src[0]); bindTex(1, src[1]); bindTex(2, src[2]); bindTex(3, src[3]);
+  bindTex(4, TEX_IDX);
+  bindTex(5, src[5]);
+  gl.uniform1i(U.pt.uPA, 0); gl.uniform1i(U.pt.uPB, 1); gl.uniform1i(U.pt.uVA, 2); gl.uniform1i(U.pt.uVB, 3);
+  gl.uniform1i(U.pt.uIDX, 4); gl.uniform1i(U.pt.uH, 5);
+  gl.uniform1f(U.pt.uCay, cay); gl.uniform1f(U.pt.uSay, say);
+  gl.uniform1f(U.pt.uCax, cax); gl.uniform1f(U.pt.uSax, sax);
+  gl.uniform1f(U.pt.uR, R); gl.uniform1f(U.pt.uIW, iw);
+  /* 拍扁视图没有深度分离，10000 点全叠在一层；L₀ 缩到 0.173 后体积密度是旧版的 ~190 倍，
+     点用默认尺寸画必然把中心糊成白团，所以这一档单独压到 0.45 倍 */
+  gl.uniform1f(U.pt.uIH, ih); gl.uniform1f(U.pt.uSize, DPR * 0.28);
+  gl.drawArrays(gl.POINTS, 0, NP);
+
+  /* 8 个中心：用与节点相同的相机投影，标在它们各自的方向上 */
+  for (let c = 0; c < NCEN; c++) {
+    const X = CENTERS[c * 5], Y = CENTERS[c * 5 + 1], Z = CENTERS[c * 5 + 2];
+    const X1 = cay * X + say * Z;
+    const Z1 = -say * X + cay * Z;
+    const Y1 = cax * Y - sax * Z1;
+    const Z2 = sax * Y + cax * Z1;
+    const pz = 1.0 / (1.0 + 0.55 * (1.0 - Z2));
+    const px = iw * 0.5 + X1 * R * pz;
+    const py = ih * 0.5 - Y1 * R * pz;
+    cenPts[c * 2] = px * 2.0 / iw - 1.0;
+    cenPts[c * 2 + 1] = 1.0 - py * 2.0 / ih;
+  }
+  gl.useProgram(progCen);
+  gl.uniform3fv(U.cen.col, CCOL);
+  gl.uniform1f(U.cen.size, DPR);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cenBuf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, cenPts);
+  gl.enableVertexAttribArray(aPCen);
+  gl.vertexAttribPointer(aPCen, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.POINTS, 0, NCEN);
+}
+
+/* ============ 主循环 ============ */
+let frames = 0, fps = 0, fpsT = 0, lastStep = 0;
+let physHz = 0, physT = 0, steps = 0;
+let statN = 0, statV = 0, statR = 0, deform = 1;
+/* VIEW3：纯三维视图开关（按 V 切换）。REC：录制句柄（按 R 起停） */
+let VIEW3 = false;
+let REC = null, recChunks = [], recT0 = 0;
+let statE = 0, statESig = 0, alivePct = 0, plantPct = 0, animalPct = 0, statPredErr = 0, statPredN = 0, statPredR2 = 0, statD1 = 0, statD1R2 = 0, statWMean = 0, statWSig = 0;
+/* ── 时间平均读数 ─────────────────────────────────────────────────
+   统计量与相位强耦合：σ(e) 在 ⟨e⟩≈0.75 时是 0.10、在 0.95 时只有 0.04，
+   所以单帧快照比不出改动前后。这里存最近 96 次统计（96×16 帧 ≈ 26 s），
+   HUD 上显示均值 ± 标准差，±0.1 量级的改动才判得出来。
+   键序：0 PR · 1 坐标5 · 2 ⟨e⟩ · 3 σ(e) · 4 C₀ · 5 加e · 6 加m */
+const AVG_N = 96, avgBuf = [];
+function avgPush() {
+  avgBuf.push([statPR, statPR5, statE, statESig, statCeq, statPR5e, statPR5m, statXi]);
+  if (avgBuf.length > AVG_N) avgBuf.shift();
+}
+function avgStat(k) {
+  const n = avgBuf.length;
+  if (n < 8) return [0, 0];
+  let s = 0, s2 = 0;
+  for (let i = 0; i < n; i++) { const v = avgBuf[i][k]; s += v; s2 += v * v; }
+  const m = s / n;
+  return [m, Math.sqrt(Math.max(0, s2 / n - m * m))];
+}
+/* 演化指标：全体基因均值 / 存活者基因均值 / 平均与最大存活年龄（秒） */
+let statGAll = 1.0, statGLive = 1.0, statAge = 0, statAgeMax = 0;
+/* 上层：8 个中心的成员数、平均归属距离、最近两组的间距（分区是否分得开） */
+const cenCount = new Int32Array(NCEN);
+const cenDist = new Float32Array(NCEN);
+let statCenMin = 0, statCenMax = 0, statCenGap = 0;
+/* 上层记忆：⟨m⟩、σ(m)、⟨|dm|⟩，以及 64 条地址的成员分布 */
+let statM = 0, statMSig = 0, statDM = 0;
+/* 维度层级流读数：⟨lvl⟩ 是全体平均层级，lvl<1 的比例说明有多少点正沉在 0 维那一档 */
+let statLvl = 0, statLvlLow = 0, statSc = 0;
+
+/* ── 两个"可与现实比较"的读数（只吃现有回读，不动物理）─────────────
+   ① 能量净流：0 维池 ⇄ 能量维 e 的搬运，按正负分账。
+      GPU 里 pool=e+sc 守恒，所以只看结果差分也能把"往哪边流"分出来。
+   ② 相关长度 ξ：e 的两点相关 C(r) 沿距离分档，取积分尺度。
+      这是无量纲量，可以拿去和湍流/临界现象的相关长度做形状比较。 */
+let statFlow0 = 0, statFlow6 = 0, statFlowNet = 0;
+let statXi = 0, statXiNear = 0, statCeq = 0;
+let prevE = new Float32Array(NP), prevSc = new Float32Array(NP), prevReady = false;
+/* 固定配对表：每次抽同一批点对，ξ 才可逐帧比较（随机重抽会让曲线抖动） */
+const XIPAIR = 12000;
+const xiA = new Int32Array(XIPAIR), xiB = new Int32Array(XIPAIR);
+{
+  let s = 12345;
+  const rnd = function () { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+  for (let k = 0; k < XIPAIR; k++) {
+    xiA[k] = Math.floor(rnd() * NP);
+    xiB[k] = Math.floor(rnd() * NP);
+  }
+}
+const XIBIN = 8, xiSum = new Float64Array(XIBIN), xiCnt = new Int32Array(XIBIN);
+let xiDr = 0.62 / 8;
+const NRID = 8, NBAR = NCEN * NRID;
+const barCount = new Int32Array(NBAR);
+const barPos = new Float32Array(NBAR * 5);   /* 每条的五维质心 = 条内容 */
+const barDist = new Float32Array(NBAR);      /* 每条成员到中心的平均归属距 */
+const barMem = new Float32Array(NBAR);       /* 每条的平均记忆 */
+const cenAcc = new Float32Array(6);          /* 只给前 k 维时，条地址读出中心的准确率 */
+const ridAcc = new Float32Array(6);
+let statBarMin = 0, statBarMax = 0, statBarLive = 0;
+const hist = new Int32Array(10);
+let syncBuf = new Uint8Array(4);
+
+function frame(now) {
+  const t0 = performance.now();
+
+  const t1 = performance.now();
+  inTick();
+  physPass();
+  indexPass();
+  render(now);
+
+  /* 读回统计：每 16 帧一次，同时把 GPU 队列同步掉，得到真实一步耗时 */
+  statN++;
+  if (statN >= 16) {
+    statN = 0;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, cur === 0 ? FBO_A : FBO_B);
+    gl.readBuffer(gl.COLOR_ATTACHMENT2);
+    gl.readPixels(0, 0, GRID, GRID, gl.RGBA, gl.FLOAT, readBuf);
+    gl.readBuffer(gl.COLOR_ATTACHMENT3);
+    gl.readPixels(0, 0, GRID, GRID, gl.RGBA, gl.FLOAT, readBuf2);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    gl.readPixels(0, 0, GRID, GRID, gl.RGBA, gl.FLOAT, readBufP);
+    gl.readBuffer(gl.COLOR_ATTACHMENT1);
+    gl.readPixels(0, 0, GRID, GRID, gl.RGBA, gl.FLOAT, readBufQ);
+    gl.readBuffer(gl.COLOR_ATTACHMENT4);
+    gl.readPixels(0, 0, GRID, GRID, gl.RGBA, gl.FLOAT, readBufG);
+    gl.readBuffer(gl.COLOR_ATTACHMENT5);
+    gl.readPixels(0, 0, GRID, GRID, gl.RGBA, gl.FLOAT, readBufH);
+    /* 每点相位预测器只在记录期间读回（每 20 帧一次），稳态不付这份带宽 */
+    if (inRecording) {
+      gl.readBuffer(gl.COLOR_ATTACHMENT6);
+      gl.readPixels(0, 0, GRID, GRID, gl.RGBA, gl.FLOAT, readBufPe);
+    }
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    statV = 0;
+    let eSum = 0, eSq = 0, alive = 0, plantN = 0, animalN = 0;
+    let gAll = 0, gLive = 0, nLive = 0, ageSum = 0, ageN = 0, ageMax = 0;
+    let mSum = 0, mSq = 0, dmAbs = 0;
+    let lvlSum = 0, lvlLow = 0, scSum = 0, peAbs = 0, peN = 0, d1Abs = 0, wSum = 0, wSq = 0;
+    for (let i = 0; i < NP; i++) {
+      const b = i * 4;
+      const vx = readBuf[b], vy = readBuf[b + 1], vz = readBuf[b + 2];
+      const v3 = readBuf2[b], v4 = readBuf2[b + 1];
+      statV += Math.sqrt(vx * vx + vy * vy + vz * vz + v3 * v3 + v4 * v4);
+      const e = readBuf[b + 3];
+      eSum += e; eSq += e * e;
+      if (e > 0.5) alive++;
+      const role = readBuf2[b + 3];
+      if (role < 0.35) plantN++; else if (role > 0.65) animalN++;
+      /* 基因库与年龄：存活个体的基因均值若高于全体，说明选择正在起作用 */
+      const gene = readBufG[b], age = readBufG[b + 1];
+      if (inRecording) { peAbs += Math.abs(readBufPe[b + 3]); peN++; d1Abs += Math.abs(e - prevEStat[i]); prevEStat[i] = e; wSum += readBufPe[b]; wSq += readBufPe[b] * readBufPe[b]; }
+      gAll += gene;
+      if (e > 0.45) { gLive += gene; nLive++; }
+      if (e > 0.05) { ageSum += age; ageN++; if (age > ageMax) ageMax = age; }
+      /* 上层记忆：m 自身、它的变化率、以及绝对差（判断有没有在流动） */
+      const m = readBufH[b], dm = readBufH[b + 1];
+      mSum += m; mSq += m * m; dmAbs += Math.abs(dm);
+      /* 0 维储能池 sc（G.w）：与 e 反相，两者之和=每点总能量 */
+      scSum += readBufG[b + 3];
+      /* 维度层级：lvl 均值与"沉在 0 维"的比例 —— 循环是否真的在跑就看这两个数 */
+      const lvl = readBufH[b + 3];
+      lvlSum += lvl; if (lvl < 1.0) lvlLow++;
+    }
+    statSc = scSum / NP;
+    statLvl = lvlSum / NP;
+    statLvlLow = lvlLow / NP;
+    statM = mSum / NP;
+    statMSig = Math.sqrt(Math.max(0, mSq / NP - statM * statM));
+    statDM = dmAbs / NP;
+    statV /= NP;
+    statE = eSum / NP;
+    /* 只在记录期间更新，记录结束后保留最后一帧记录里的读数，不被稳态的 0 覆盖 */
+    if (peN > 0) { statPredErr = peAbs / peN; statPredN = peN;
+      /* 每点预测的 R²：用同一时刻每点 e 的实际方差当分母。
+         1 - δ²/σ² ≈ 0 表示"只学会了均值"，≈ 1 表示真能预测每一点。 */
+      const varE = Math.max(1e-6, eSq / NP - statE * statE);
+      statPredR2 = 1 - (statPredErr * statPredErr) / varE;
+      /* 单点持续性基准（同一帧、同一分母）：|e(t) − e(t−16帧)|，任何"每点模型"都得先赢过它 */
+      statD1 = d1Abs / NP;
+      statD1R2 = 1 - (statD1 * statD1) / varE;
+      /* w 的离散度：如果 σ(w)≈0，说明所有点的 w 收敛到同一个数，
+         那"按 w 调塑性"就没有任何空间结构可用 —— 这是反馈进物理的前提检验 */
+      statWMean = wSum / peN;
+      statWSig = Math.sqrt(Math.max(0, wSq / peN - statWMean * statWMean)); }
+    phAcc();
+    statESig = Math.sqrt(Math.max(0, eSq / NP - statE * statE));
+    alivePct = alive / NP * 100;
+    plantPct = plantN / NP * 100;
+    animalPct = animalN / NP * 100;
+    statGAll = gAll / NP;
+    statGLive = nLive > 0 ? gLive / nLive : statGAll;
+    statAge = ageN > 0 ? ageSum / ageN : 0;
+    statAgeMax = ageMax;
+
+    if (TRK.on) {
+      const b = TRK.idx * 4;
+      const vx = readBuf[b], vy = readBuf[b + 1], vz = readBuf[b + 2];
+      const v3 = readBuf2[b], v4 = readBuf2[b + 1];
+      TRK.rows.push([
+        (performance.now() - TRK.t0) / 1000,
+        readBuf[b + 3], readBuf2[b + 3], readBufP[b + 3],
+        Math.sqrt(vx * vx + vy * vy + vz * vz + v3 * v3 + v4 * v4)
+      ]);
+    }
+
+    statR = 0;
+    hist.fill(0);
+    let sER = 0, sRR = 0, sEE = 0;
+    for (let i = 0; i < NP; i++) {
+      const b = i * 4;
+      const x0 = readBufP[b], x1 = readBufP[b + 1], x2 = readBufP[b + 2];
+      const x3 = readBufQ[b], x4 = readBufQ[b + 1];
+      const r = Math.sqrt(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3 + x4 * x4);
+      statR += r;
+      hist[Math.min(9, Math.floor(r / 0.98 * 10))]++;
+      const e2 = readBuf[b + 3];
+      sER += e2 * r; sRR += r * r; sEE += e2 * e2;
+    }
+    statR /= NP;
+    /* corr(e,r)：电磁力真在工作的话，能量会在空间上分层（高能在外、低能在内，或反过来） */
+    const dEE = NP * sEE - eSum * eSum, dRR = NP * sRR - statR * NP * statR * NP;
+    statCorrER = (dEE > 1e-12 && dRR > 1e-12) ? (NP * sER - eSum * statR * NP) / Math.sqrt(dEE * dRR) : 0;
+
+    /* ── ① 能量净流：0 维池 ⇄ e ─────────────────────────────────────────
+       只取"两边同时反向变化"的那部分（min 配对），单向变化是光合注入或 burn，
+       不是搬运，必须滤掉。除以 NP 与 16（统计间隔）后是"每点每步"的能量单位。 */
+    let f0 = 0, f6 = 0;
+    for (let i = 0; i < NP; i++) {
+      const b = i * 4;
+      const eNow = readBuf[b + 3], scNow = readBufG[b + 3];
+      if (prevReady) {
+        const de = eNow - prevE[i], ds = scNow - prevSc[i];
+        if (de < 0 && ds > 0) f0 += Math.min(-de, ds);
+        if (de > 0 && ds < 0) f6 += Math.min(de, -ds);
+      }
+      prevE[i] = eNow; prevSc[i] = scNow;
+    }
+    prevReady = true;
+    /* 换算成"每点每秒"（DT=1/80，统计间隔 16 步） */
+    statFlow0 = f0 / NP / 16 * 80;
+    statFlow6 = f6 / NP / 16 * 80;
+    statFlowNet = statFlow0 - statFlow6;
+
+    /* ── ② e 的两点相关 C(r) 与相关长度 ξ ────────────────────────────
+       固定配对表 + 沿 5 维距离分 8 档；ξ 取积分尺度（积到 C 首次 ≤0 为止）。
+       这是无量纲量，能和湍流能谱、临界现象的相关长度做形状比较。 */
+    xiSum.fill(0); xiCnt.fill(0);
+    const s2e = Math.max(statESig * statESig, 1e-9);
+    for (let k = 0; k < XIPAIR; k++) {
+      const ba = xiA[k] * 4, bb = xiB[k] * 4;
+      let dd = 0, dt;
+      dt = readBufP[ba] - readBufP[bb]; dd += dt * dt;
+      dt = readBufP[ba + 1] - readBufP[bb + 1]; dd += dt * dt;
+      dt = readBufP[ba + 2] - readBufP[bb + 2]; dd += dt * dt;
+      dt = readBufQ[ba] - readBufQ[bb]; dd += dt * dt;
+      dt = readBufQ[ba + 1] - readBufQ[bb + 1]; dd += dt * dt;
+      const bin = Math.floor(Math.sqrt(dd) / xiDr);
+      if (bin < 0 || bin >= XIBIN) continue;
+      xiSum[bin] += (readBuf[ba + 3] - statE) * (readBuf[bb + 3] - statE);
+      xiCnt[bin]++;
+    }
+    /* 积分尺度：累加所有正相关档。之前遇到负档就 break，导致 ξ 恒为 0
+       （最短距离档常常是反相关的，直接截断会把整段正相关丢掉）。 */
+    let xiAcc = 0, xiNear = 0;
+    for (let k = 0; k < XIBIN; k++) {
+      const C = xiCnt[k] > 0 ? (xiSum[k] / xiCnt[k]) / s2e : 0;
+      if (k === 0) xiNear = C;
+      if (C > 0) xiAcc += C * xiDr;
+    }
+    statXi = xiAcc;
+    statXiNear = xiNear;
+    /* 近邻相关直接用 16621 条真实边算 —— 随机配对在最短距离档样本太少，正负乱跳 */
+    let ceSum = 0;
+    for (let ei2 = 0; ei2 < EDGE_N; ei2++) {
+      const ea = edges[ei2 * 2], eb = edges[ei2 * 2 + 1];
+      ceSum += (readBuf[ea * 4 + 3] - statE) * (readBuf[eb * 4 + 3] - statE);
+    }
+    statCeq = (ceSum / EDGE_N) / s2e;
+
+    /* 有效维数 PR：7 个可读量各自标准化后的相关矩阵，特征值算参与比 */
+    for (let i = 0; i < NP; i++) {
+      const b = i * 4, o = i * 7;
+      PR7[o] = readBufP[b]; PR7[o + 1] = readBufP[b + 1]; PR7[o + 2] = readBufP[b + 2];
+      PR7[o + 3] = readBufQ[b]; PR7[o + 4] = readBufQ[b + 1];
+      PR7[o + 5] = readBuf[b + 3]; PR7[o + 6] = readBufH[b];
+    }
+    PR_MU.fill(0); PR_SD.fill(0);
+    for (let i = 0; i < NP; i++) { const o = i * 7; for (let j = 0; j < 7; j++) PR_MU[j] += PR7[o + j]; }
+    for (let j = 0; j < 7; j++) PR_MU[j] /= NP;
+    for (let i = 0; i < NP; i++) {
+      const o = i * 7;
+      for (let j = 0; j < 7; j++) { const d = PR7[o + j] - PR_MU[j]; PR_SD[j] += d * d; }
+    }
+    for (let j = 0; j < 7; j++) { PR_SD[j] = Math.sqrt(PR_SD[j] / NP); if (PR_SD[j] < 1e-9) PR_SD[j] = 1; }
+    PR_COR.fill(0);
+    for (let i = 0; i < NP; i++) {
+      const o = i * 7;
+      for (let a = 0; a < 7; a++) {
+        const da = (PR7[o + a] - PR_MU[a]) / PR_SD[a];
+        for (let b2 = a; b2 < 7; b2++) PR_COR[a * 7 + b2] += da * (PR7[o + b2] - PR_MU[b2]) / PR_SD[b2];
+      }
+    }
+    for (let a = 0; a < 7; a++) for (let b2 = a; b2 < 7; b2++) { PR_COR[a * 7 + b2] /= NP; PR_COR[b2 * 7 + a] = PR_COR[a * 7 + b2]; }
+    const lam7 = jacobiEig(7, PR_COR);
+    let s1 = 0, s2 = 0;
+    for (let j = 0; j < 7; j++) { s1 += lam7[j]; s2 += lam7[j] * lam7[j]; }
+    statPR = s2 > 1e-12 ? (s1 * s1) / s2 : 0;
+    /* 拆开看谁真的贡献维度：相关矩阵的子块就是子集自己的相关矩阵，直接取块做 Jacobi */
+    const prBlock = function (idx) {
+      const n = idx.length, A = new Float64Array(n * n);
+      for (let a = 0; a < n; a++) for (let b = 0; b < n; b++) A[a * n + b] = PR_COR[idx[a] * 7 + idx[b]];
+      const lam = jacobiEig(n, A);
+      let t1 = 0, t2 = 0;
+      for (let j = 0; j < n; j++) { t1 += lam[j]; t2 += lam[j] * lam[j]; }
+      return t2 > 1e-12 ? (t1 * t1) / t2 : 0;
+    };
+    statPR5 = prBlock([0, 1, 2, 3, 4]);
+    statPR5e = prBlock([0, 1, 2, 3, 4, 5]);
+    statPR5m = prBlock([0, 1, 2, 3, 4, 6]);
+    statPRxyz = prBlock([0, 1, 2]);
+    statPRph = prBlock([3, 4]);
+
+    avgPush();
+
+    const stride = Math.max(1, Math.floor(EDGE_N / 400));
+    let lsum = 0, ln = 0;
+    for (let e = 0; e < EDGE_N; e += stride) {
+      const a = edges[e * 2], b2 = edges[e * 2 + 1];
+      const oa = a * 4, ob = b2 * 4;
+      const d0 = readBufP[oa] - readBufP[ob];
+      const d1 = readBufP[oa + 1] - readBufP[ob + 1];
+      const d2 = readBufP[oa + 2] - readBufP[ob + 2];
+      const d3 = readBufQ[oa] - readBufQ[ob];
+      const d4 = readBufQ[oa + 1] - readBufQ[ob + 1];
+      lsum += Math.sqrt(d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4);
+      ln++;
+    }
+    deform = (lsum / ln) / L0;
+
+    /* 上层索引：读回 cid 与归属距离，看 8 个中心各领走多少人、分区清不清晰 */
+    gl.bindFramebuffer(gl.FRAMEBUFFER, IFBO);
+    gl.readPixels(0, 0, GRID, GRID, gl.RGBA, gl.FLOAT, readBufI);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    cenCount.fill(0); cenDist.fill(0); barCount.fill(0);
+    barPos.fill(0); barMem.fill(0); barDist.fill(0);
+    cenOff.fill(0);
+    eBin.fill(0); mBin.fill(0); binCnt.fill(0);
+    for (let i = 0; i < NP; i++) {
+      const b = i * 4;
+      const c = Math.min(NCEN - 1, Math.max(0, Math.round(readBufI[i * 4])));
+      cenCount[c]++; cenDist[c] += readBufI[i * 4 + 1];
+      /* 读出分箱：按出生半径 8 等分，与输入的空间权重同轴 */
+      const rbB = readBufP[b + 3];
+      const bi8 = Math.min(7, Math.max(0, Math.floor(Math.min(1, Math.max(0, rbB / 0.96)) * 8)));
+      eBin[bi8] += readBuf[b + 3];
+      mBin[bi8] += readBufH[b];
+      binCnt[bi8]++;
+      /* 条地址：cid*8 + rid，rid 由 shader 按归属半径切 8 档写成 */
+      const rid = Math.min(NRID - 1, Math.max(0, Math.round(readBufI[i * 4 + 2])));
+      const k = c * NRID + rid;
+      barCount[k]++;
+      /* 条内容 = 该条成员的五维质心 + 平均记忆 */
+      barPos[k * 5] += readBufP[b]; barPos[k * 5 + 1] += readBufP[b + 1];
+      barPos[k * 5 + 2] += readBufP[b + 2];
+      barPos[k * 5 + 3] += readBufQ[b]; barPos[k * 5 + 4] += readBufQ[b + 1];
+      barMem[k] += readBufH[b];
+      cenOff[0] += readBufP[b]; cenOff[1] += readBufP[b + 1]; cenOff[2] += readBufP[b + 2];
+      cenOff[3] += readBufQ[b]; cenOff[4] += readBufQ[b + 1];
+    }
+    for (let j = 0; j < 5; j++) cenOff[j] /= NP;
+    rebuildCenters();
+    for (let k = 0; k < NBAR; k++) {
+      if (barCount[k] > 0) {
+        for (let j = 0; j < 5; j++) barPos[k * 5 + j] /= barCount[k];
+        barMem[k] /= barCount[k];
+        /* 条距用"质心到所属中心的距离"，不能用成员平均距：
+           质心是坐标均值，按三角不等式它总比平均距更贴中心，拿平均距当模板会全部误判到最内档 */
+        const c = Math.floor(k / NRID);
+        let d2 = 0;
+        for (let j = 0; j < 5; j++) { const t = barPos[k * 5 + j] - (CENTERS[c * 5 + j] + cenOff[j]); d2 += t * t; }
+        barDist[k] = Math.sqrt(d2);
+      }
+    }
+    /* ---- 骨架读出：只给前 k 维条内容，看能不能认出它属于哪个中心、哪一条 ----
+       k=5 时用的就是产生 rid 的同一套规则，所以必然 100%；k<5 掉多少，才是维度损耗 */
+    for (let kk = 1; kk <= 5; kk++) {
+      let okC = 0, okR = 0, tot = 0;
+      for (let k = 0; k < NBAR; k++) {
+        if (barCount[k] === 0) continue;
+        tot++;
+        let best = 1e9, bi = 0;
+        for (let c = 0; c < NCEN; c++) {
+          let d2 = 0;
+          for (let j = 0; j < kk; j++) { const t = barPos[k * 5 + j] - (CENTERS[c * 5 + j] + cenOff[j]); d2 += t * t; }
+          if (d2 < best) { best = d2; bi = c; }
+        }
+        if (bi === Math.floor(k / NRID)) okC++;
+        /* rid 不能直接用"距离÷尺度"反推（那样永远落在第 4 档），
+           要在该中心的 8 个档模板里找距离最接近的那个 */
+        const dkk = Math.sqrt(best);
+        let bd = 1e9, ridP = 0;
+        for (let r = 0; r < NRID; r++) {
+          const bk = bi * NRID + r;
+          if (barCount[bk] === 0) continue;
+          const t = Math.abs(dkk - barDist[bk]);
+          if (t < bd) { bd = t; ridP = r; }
+        }
+        if (ridP === (k % NRID)) okR++;
+      }
+      cenAcc[kk] = tot > 0 ? okC / tot * 100 : 0;
+      ridAcc[kk] = tot > 0 ? okR / tot * 100 : 0;
+    }
+    statBarMin = 1e9; statBarMax = 0; statBarLive = 0;
+    for (let k = 0; k < NBAR; k++) {
+      if (barCount[k] > 0) statBarLive++;
+      if (barCount[k] < statBarMin) statBarMin = barCount[k];
+      if (barCount[k] > statBarMax) statBarMax = barCount[k];
+    }
+    statCenMin = 1e9; statCenMax = 0;
+    for (let c = 0; c < NCEN; c++) {
+      if (cenCount[c] > 0) cenDist[c] /= cenCount[c];
+      if (cenCount[c] < statCenMin) statCenMin = cenCount[c];
+      if (cenCount[c] > statCenMax) statCenMax = cenCount[c];
+      sArr[c] = 4.0 / Math.max(cenDist[c], 1e-3);
+    }
+    /* 中心两两最小间距：与平均归属半径比较，>2 倍说明分区有明确边界 */
+    statCenGap = 1e9;
+    for (let a = 0; a < NCEN; a++) {
+      for (let b = a + 1; b < NCEN; b++) {
+        let d2 = 0;
+        for (let j = 0; j < 5; j++) { const t = CENTERS[a * 5 + j] - CENTERS[b * 5 + j]; d2 += t * t; }
+        const d = Math.sqrt(d2);
+        if (d < statCenGap) statCenGap = d;
+      }
+    }
+  }
+
+
+/* 真实耗时：readPixels 已同步过 GPU 队列，t0→now 包含提交 */  lastStep = performance.now() - t0;
+  frames++;
+  if (now - fpsT > 600) {
+    fps = frames / ((now - fpsT) / 1000); fpsT = now; frames = 0;
+  }
+  inSample();
+
+  hud.innerHTML =
+    '五维场 · <b>完美世界</b>&nbsp;&nbsp;ℝ<sup>5</sup> · <b>全 GPU</b> · 种子 伪随机（无 π）<br>' +
+    '点 <b>' + NP + '</b> · 连接 <b>' + EDGE_N + '</b> · 每点 <b>' + K + '</b> 边<br>' +
+    '物理 <b>fragment</b> · 渲染 <b>vertex</b> · 状态 <b>RGBA32F</b> 双缓冲<br>' +
+    '⟨|v|⟩ <b>' + statV.toFixed(4) + '</b> · 变形 <b>' + deform.toFixed(3) + '</b>×L₀<br>' +
+    '活 <b>' + alivePct.toFixed(1) + '</b>% · ⟨e⟩ <b>' + statE.toFixed(3) + '</b> · σ <b>' + statESig.toFixed(3) +
+      '</b><br>' +
+    '植 <b>' + plantPct.toFixed(1) + '</b>% · 动 <b>' + animalPct.toFixed(1) + '</b>%<br>' +
+    '基因 ⟨g⟩ <b>' + statGAll.toFixed(3) + '</b> → 存活 <b>' + statGLive.toFixed(3) + '</b> · 年龄 ⟨' + statAge.toFixed(0) + 's⟩ 最长 ' + statAgeMax.toFixed(0) + 's<br>' +
+    '上层 <b>' + NCEN + '</b> 中心 · 成员 ' + statCenMin + '–' + statCenMax + ' · 归属距 ⟨' +
+      ((cenDist.reduce(function (a, b) { return a + b; }, 0)) / NCEN).toFixed(3) +
+      '⟩ · 中心最小间距 ' + statCenGap.toFixed(2) + ' · 只读不写物理 · 内层 L <b>' + BOX.toFixed(2) + '</b><br>' +
+    '记忆 ⟨m⟩ <b>' + statM.toFixed(3) + '</b> · σ <b>' + statMSig.toFixed(3) + '</b> · ⟨|dm/dt|⟩ <b>' + statDM.toFixed(3) +
+      '</b> · 条地址 <b>' + statBarLive + '/' + NBAR + '</b> 有效 · 成员 ' + statBarMin + '–' + statBarMax + '<br>' +
+    '层级 ⟨lvl⟩ <b>' + statLvl.toFixed(2) + '</b> / 5 · 沉在 0 维 <b>' + (statLvlLow * 100).toFixed(1) +
+      '</b>% · 0 维池 ⟨sc⟩ <b>' + statSc.toFixed(3) + '</b> ⇄ 能量维 ⟨e⟩ <b>' + statE.toFixed(3) + '</b><br>' +
+    '能量净流 →0 维 <b>' + statFlow0.toExponential(2) + '</b> · →6 维 <b>' + statFlow6.toExponential(2) +
+      '</b> · 净 <b>' + statFlowNet.toExponential(2) + '</b>（每点每秒）<br>' +
+    '相关长度 ξ <b>' + statXi.toFixed(3) + '</b> · 近邻相关 C₀ <b>' + statCeq.toFixed(3) + '</b>（16621 条边）<br>' +
+    '骨架 读出 cid ' + [1, 2, 3, 4, 5].map(function (k) { return Math.round(cenAcc[k]); }).join('/') +
+      '% · rid ' + [1, 2, 3, 4, 5].map(function (k) { return Math.round(ridAcc[k]); }).join('/') + '%（只给前 1–5 维）<br>' +
+    '有效维数 PR <b>' + statPR.toFixed(2) + '</b> / 7 · 坐标5 <b>' + statPR5.toFixed(2) +
+      '</b>（x₀x₁x₂ ' + statPRxyz.toFixed(2) + ' · x₃x₄ ' + statPRph.toFixed(2) + '）· 加 e <b>' +
+      statPR5e.toFixed(2) + '</b> · 加 m <b>' + statPR5m.toFixed(2) + '</b><br>' +
+    '时间平均 ⟨' + (avgBuf.length * 16 / 60).toFixed(0) + ' s⟩ PR <b>' +
+      (avgBuf.length >= 8 ? avgStat(0)[0].toFixed(2) + '</b>±' + avgStat(0)[1].toFixed(2) : '—') +
+      ' · 坐标5 <b>' + (avgBuf.length >= 8 ? avgStat(1)[0].toFixed(2) + '</b>±' + avgStat(1)[1].toFixed(2) : '—') +
+      ' · 加 e <b>' + (avgBuf.length >= 8 ? avgStat(5)[0].toFixed(2) + '</b>±' + avgStat(5)[1].toFixed(2) : '—') +
+      ' · 加 m <b>' + (avgBuf.length >= 8 ? avgStat(6)[0].toFixed(2) + '</b>±' + avgStat(6)[1].toFixed(2) : '—') +
+      ' · ⟨e⟩ <b>' + (avgBuf.length >= 8 ? avgStat(2)[0].toFixed(3) + '</b>±' + avgStat(2)[1].toFixed(3) : '—') +
+      ' · C₀ <b>' + (avgBuf.length >= 8 ? avgStat(4)[0].toFixed(3) + '</b>±' + avgStat(4)[1].toFixed(3) : '—') +
+      ' · ξ <b>' + (avgBuf.length >= 8 ? avgStat(7)[0].toFixed(3) + '</b>±' + avgStat(7)[1].toFixed(3) : '—') + '<br>' +
+
+    '输入口 u∈{−1,+1} · 相位调制 INSEL <b>' + RL.INSEL.toFixed(2) + '</b>（按 <b>U</b> 切档）· ' +
+      (inRecording
+        ? ('记录中 <b>' + inSamples.length + '</b>/' + IN_N + ' · 按 <b>I</b> 停止')
+        : (statInReady
+          ? ('记忆容量 MC <b>' + statMC.toFixed(1) + '</b>/' + (IN_LAG + 1) +
+            ' · 峰 R² <b>' + statPeak.toFixed(2) + '</b> @ k<b>' + statPeakLag + '</b>（' + (statPeakLag * 0.25).toFixed(2) + ' s）· lag0 <b>' + statR0.toFixed(2) + '</b> · 按 <b>O</b> 导出 · <b>I</b> 重测')
+          : '待机 · 按 <b>I</b> 实测记忆容量')) +
+    ' · 自预测 δ <b>' + onD.toFixed(3) + '</b>（早期 <b>' + onD0.toFixed(3) + '</b>）· w <b>' + onW1.toFixed(2) + '</b>/<b>' + onW2.toFixed(2) + '</b>（' + onN + ' 步）· 相位 R² <b>' + statPh.toFixed(3) + '</b> · 跨圈预测 δ <b>' + predD.toFixed(3) + '</b>（' + predN + ' 次）· 每点 |δ| <b>' + statPredErr.toFixed(3) + '</b>/<b>' + statPredN + '</b> · 每点 R² <b>' + statPredR2.toFixed(3) + '</b> · 首点 <b>' + readBufPe[0].toFixed(3) + '/' + readBufPe[1].toFixed(3) + '/' + readBufPe[2].toFixed(3) + '</b> · 单点 lag16帧 |δ| <b>' + statD1.toFixed(3) + '</b> R² <b>' + statD1R2.toFixed(3) + '</b> · w <b>' + statWMean.toFixed(3) + '</b>±<b>' + statWSig.toFixed(3) + '</b>' + '<br>' +
+    '8 维解码 · ' + DEC_NAME.map(function (n, i) { return n + ' R² <b>' + statPhK[i].toFixed(3) + '</b> δ <b>' + (predDK[i] ? predDK[i].toFixed(3) : '—') + '</b>'; }).join(' · ') + ' · 独立通道 <b>' + statDecRank.toFixed(2) + '</b>/4（λ ' + statDecK.map(function (x) { return x.toFixed(2); }).join('/') + '）· 写 <b>' + WRITE_AMP.toFixed(2) + '</b>@ψ<b>' + WRITE_PH.toFixed(2) + '</b>（按 <b>W</b> 切档）· 地址档 <b>' + wrAddrMode + '</b>（按 <b>Q</b>）· loc ' + (U.phys.uWE ? '<b>ok</b>' : '<b>NULL</b>') + ' · 箱形 ⟨e⟩ ' + Array.from({ length: 16 }, function (_, i) { return (phN[i] > 0 ? phSumK[0][i] / phN[i] : 0).toFixed(2); }).join(' ') + '<br>' +
+    '一步 <b>' + lastStep.toFixed(2) + '</b> ms · <b>' + fps.toFixed(0) + '</b> fps · 按 <b>D</b> 导出全部状态' +
+    ' · <b>T</b> 追踪单点 <b>Y</b> 导出一生 · <b>B</b> 内层 L' +
+    (TRK.on ? ' · #' + TRK.idx + ' ' + TRK.rows.length + ' 样本' : '') + '<br>' +
+    '视图 <b>' + (VIEW3 ? 'x₀x₁x₂ 三维' : 'ℝ⁵ 拍扁') + '</b> · 按 <b>V</b> 切换 · 按 <b>R</b> 录制' +
+    (REC ? ' · <b style="color:#ff5a40">REC ' + ((performance.now() - recT0) / 1000).toFixed(1) + 's</b>' : '');
+
+  schedule();
+}
+
+let rafId = 0, timerId = 0;
+
+/* 导出全部 5 维状态：按 D */
+function dumpAll() {
+  const fx = function (v) { return Math.round(v * 1e6) / 1e6; };
+  const out = new Array(NP + 2);
+  out[0] = '# pi-field 5D state | NP=' + NP + ' K=' + K + ' edges=' + EDGE_N +
+           ' L0=' + L0.toFixed(6) + ' t=' + (performance.now() / 1000).toFixed(3) + 's';
+  out[1] = 'i,x0,x1,x2,x3,x4,ev,sc,m,dm,lvl,v0,v1,v2,v3,v4,r,r_birth,r_base,ph_sin,ph_cos,n0,n1,n2,n3';
+  for (let i = 0; i < NP; i++) {
+    const b = i * 4;
+    const x0 = readBufP[b], x1 = readBufP[b + 1], x2 = readBufP[b + 2];
+    const x3 = readBufQ[b], x4 = readBufQ[b + 1];
+    const v0 = readBuf[b], v1 = readBuf[b + 1], v2 = readBuf[b + 2];
+    const v3 = readBuf2[b], v4 = readBuf2[b + 1];
+    const rl = readBufP[b + 3], rb = readBuf2[b + 2];
+    const ps = readBufQ[b + 2], pc = readBufQ[b + 3];
+    const ev = readBuf[b + 3], sc = readBufG[b + 3];
+    const m = readBufH[b], dm = readBufH[b + 1], lvl = readBufH[b + 3];
+    const r = Math.sqrt(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3 + x4 * x4);
+    let line = i + ',' + fx(x0) + ',' + fx(x1) + ',' + fx(x2) + ',' + fx(x3) + ',' + fx(x4) +
+      ',' + fx(ev) + ',' + fx(sc) + ',' + fx(m) + ',' + fx(dm) + ',' + fx(lvl) +
+      ',' + fx(v0) + ',' + fx(v1) + ',' + fx(v2) + ',' + fx(v3) + ',' + fx(v4) +
+      ',' + fx(r) + ',' + fx(rl) + ',' + fx(rb) + ',' + fx(ps) + ',' + fx(pc);
+    for (let t = 0; t < K; t++) line += ',' + NEI[i * K + t];
+    out[i + 2] = line;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'text/csv' }));
+  a.download = 'pi5-state-' + NP + '.csv';
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+}
+/* 单点追踪：按 T 选中当前最活跃的个体并开始记录，再按 T 停止；按 Y 导出它的一生 */
+const TRK = { on: false, idx: 0, t0: 0, rows: [] };
+function trackToggle() {
+  TRK.on = !TRK.on;
+  if (TRK.on) {
+    /* 选一个"典型"个体：代谢量最接近全场中位水平的点，既非最强也非将死，最能代表一生 */
+    let best = 0, bv = 1e9;
+    for (let i = 0; i < NP; i++) {
+      const d = Math.abs(readBuf[i * 4 + 3] - 0.30);
+      if (d < bv) { bv = d; best = i; }
+    }
+    TRK.idx = best;
+    TRK.t0 = performance.now();
+    TRK.rows = [];
+  }
+}
+function dumpTrack() {
+  const fx = function (v) { return Math.round(v * 1e6) / 1e6; };
+  const out = ['# pi-field single life | idx=' + TRK.idx + ' samples=' + TRK.rows.length +
+               ' K=' + K + ' L0=' + L0.toFixed(6), 't,e,role,r_layer,speed'];
+  for (let i = 0; i < TRK.rows.length; i++) out.push(TRK.rows[i].map(fx).join(','));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'text/csv' }));
+  a.download = 'pi5-life-' + TRK.idx + '.csv';
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+}
+/* 录制：直接抓 canvas 的帧流，出 WebM。不依赖 ffmpeg，也不重算一遍物理。
+   录的就是屏幕上这张画面 —— 按 V 切到三维视图再录，得到的就是三维点云的视频。 */
+function recToggle() {
+  if (REC) { REC.stop(); return; }
+  if (!cv.captureStream || typeof MediaRecorder === 'undefined') {
+    hud.setAttribute('data-rec', 'unsupported');
+    return;
+  }
+  const stream = cv.captureStream(60);
+  /* 优先 mp4（Windows 双击就能播）；不支持时退回 webm */
+  let mime = 'video/mp4;codecs=avc1.42E01E';
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp9';
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
+  const ext = mime.indexOf('mp4') >= 0 ? '.mp4' : '.webm';
+  recChunks = [];
+  REC = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 16000000 });
+  REC.ondataavailable = function (e) { if (e.data && e.data.size) recChunks.push(e.data); };
+  REC.onstop = function () {
+    const blob = new Blob(recChunks, { type: mime });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'pi5-' + (VIEW3 ? '3d' : '5d') + '-' + Date.now() + ext;
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+    stream.getTracks().forEach(function (tr) { tr.stop(); });
+    REC = null; recT0 = 0; recChunks = [];
+  };
+  REC.start();
+  recT0 = performance.now();
+}
+
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'd' || e.key === 'D') { e.preventDefault(); dumpAll(); }
+  if (e.key === 't' || e.key === 'T') { e.preventDefault(); trackToggle(); }
+  if (e.key === 'y' || e.key === 'Y') { e.preventDefault(); dumpTrack(); }
+  if (e.key === 'b' || e.key === 'B') { e.preventDefault(); boxCycle(); }
+  if (e.key === 'v' || e.key === 'V') { e.preventDefault(); VIEW3 = !VIEW3; }
+  if (e.key === 'r' || e.key === 'R') { e.preventDefault(); recToggle(); }
+  if (e.key === 'i' || e.key === 'I') { e.preventDefault(); inToggle(); }
+  if (e.key === 'o' || e.key === 'O') { e.preventDefault(); inDump(); }
+  if (e.key === 'u' || e.key === 'U') { e.preventDefault(); inselCycle(); }
+  if (e.key === 'w' || e.key === 'W') { e.preventDefault(); writeCycle(); }
+  if (e.key === 'q' || e.key === 'Q') { e.preventDefault(); wrAddr((wrAddrMode + 1) % 4); }
+});
+
+/* P0 档位：0 = 原行为（输入只调幅度）· 0.60 = 相位调制 · 1.00 = 强调制。
+   切档不清 CLK，因为相位偏移本身就是被观测的量。 */
+const INSEL_STEPS = [0.0, 0.60, 1.00];
+let inselIdx = 1;
+function inselCycle() {
+  inselIdx = (inselIdx + 1) % INSEL_STEPS.length;
+  RL.INSEL = INSEL_STEPS[inselIdx];
+  console.log('INSEL -> ' + RL.INSEL.toFixed(2) + ' (idx ' + inselIdx + ')');
+}
+
+/* ── 输入口与记忆容量实测（储备池判据）───────────────────────────────
+   每 16 帧（0.2 s 物理时间）换一次二值输入 u ∈ {−1,+1}；
+   同一时刻采样一次读出特征：64 条地址的平均记忆 + 4 个全场量。
+   攒满 256 步后，对每个延迟 k 做岭回归拟合 u(t−k)，
+   记忆容量 MC = Σ_k max(0, R²_k)，满分 = 延迟档数 21。
+   读出只用宏观可观测量、不含逐点坐标 —— 否则测到的是输入端直通，不是记忆。 */
+const IN_SAMP = 20;          /* 每 20 帧一个输入步 = 0.25 s 物理时间 */
+const IN_N = 256;            /* 记录 256 步 ≈ 85 s 实际。加长到 256 的原因：
+                                记忆峰随 m 的 τ 一起右移。τ=10 s 时峰在 lag2（0.5 s），
+                                要测 τ=20 s 就必须让记录 ≥ 3τ，否则 m 在记录期内只走 1.6 个
+                                时间常数、留出段分布与训练段不同，R² 会假性崩塌。 */
+const IN_LAG = 64;           /* 延迟 0..64 步 = 0..16.0 s 物理时间。
+                                上一版 32 阶时曲线到 lag32 仍有 0.19（还没到 0），
+                                所以这次把探测窗再拉一倍，看这条记忆尾巴到底收在哪里。
+                                256 步记录下 lag64 仍有 104 个训练点，够单变量回归。 */
+/* ══ 记忆容量的完整负结果链（本轮实测，改代码前务必先看这段）════════════
+   同一套源码，换个评估口径就给出完全不同的数字：
+
+     口径                               MC      lag0 R²
+     20 特征 · 训练集内 · 白噪声       3.7      0.15
+     20 特征 · 训练集内 · 低通+0.60    13.6     0.79   ← 曾误判为里程碑
+     20 特征 · 训练集内 · lag 拉到 32   19.5     0.57
+     20 特征 · 留出集 · λ 1e−2         3.6      0.41
+     20 特征 · 留出集 · λ 5e−2         1.3     −0.16
+      4 特征 · 留出集 · λ 1e−2         1.8      0.06
+      5 特征 · 留出集（含 ⟨m⟩）         3.2     −0.57   ← 加 m 反而更差
+
+   结论：真实记忆容量 ≈ 0。输入 u 对 ⟨e⟩/⟨sc⟩/⟨lvl⟩/⟨|v|⟩/⟨m⟩ 没有留下任何
+   留出可预测的痕迹，lag0 就已经是 0 到负。13.6 是本装置自带的过拟合
+   （nf/n ≈ 0.21 的无信息基线被特征数撑起来），不是系统的性质。
+
+   物理上为什么是 0：CLK 的相位调制只改振荡相位，不改 e 的稳态值；
+   plantGain 的 uIn 项被 burn 阈值压成净耗散。两个通路都到不了稳态。
+   要真记忆，必须让输入改一个"稳态点"（want0 的目标值）或一个不被
+   阈值削掉的慢状态 —— 这两条此前都试过并失败。
+═══════════════════════════════════════════════════════════════════ */
+const IN_NF = 1;             /* 特征维：只留 ⟨m⟩ —— 全场唯一的慢状态（τ 2–20 s，随 ψ 摆动）。
+                                为什么砍到 1 维：5 特征时 lag0 R² 只有 0.11、lag1 就转负，
+                                但 lag0 与 m 的自相关（相邻采样点仅差 20/320 = 6%）本该几乎相同 ——
+                                这种"立刻崩"不是没有记忆，是 4 个与输入无关的特征
+                                （⟨e⟩/⟨sc⟩/⟨lvl⟩/⟨|v|⟩）在 32 s 记录里缓慢漂移，
+                                训练段与留出段分布不同，多元回归被它们放大误差。
+                                降成单变量后 R² 就是 corr²，不存在这个混淆。 */
+let IN_VAL = 0, inTickN = 0, inPhase = 0, inRecording = false, inSamples = [];
+/* 每点相位预测器的学习率。0 = 完全关闭（这一块变成恒等，不改物理）。
+   0.02 是按全局那版 NLMS 的量级折过来的：全局版用的 0.05 配的是 1 维输入，
+   这里 3 个系数共用同一个 δ，压到 0.02 让它慢一点、不抖。 */
+let PRED_ETA = 0.02;
+
+/* ── 8 维写通道的三个档位（按键 W 循环）──────────────────────────────
+   WRITE_AMP 是写入幅度：植物源项按相位门额外乘 (1+amp*wGate)。
+   WRITE_PH 是写哪个相位窗口（0 = 从 ψ=0 开始的那一段）。
+   默认 0 表示不写 —— 先量出"写进去之后相位形状会不会被改写、代价多大"。 */
+let WRITE_AMP = 0, WRITE_PH = 0;
+const WRITE_STEPS = [0.0, 0.10, 0.25, 0.50];
+const WRITE_PH_STEPS = [0.0, 0.25, 0.50, 0.75];
+let writeIdx = 0;
+/* 8 维内部的 16 个相位地址：每个箱一个独立写入偏置，默认全 0 */
+const WR_E = new Float32Array(16);
+let wrAddrMode = 0;
+function writeCycle() {
+  writeIdx = (writeIdx + 1) % WRITE_STEPS.length;
+  WRITE_AMP = WRITE_STEPS[writeIdx];
+  WRITE_PH = WRITE_PH_STEPS[writeIdx];
+  phReset();
+}
+/* 可寻址写：wrAddr(mode)
+   0 全关 · 1 只抬谷箱（第 9 箱）· 2 只压峰箱（第 0 箱）· 3 全 16 箱（对照）
+   符号必须注意：want0 是 sc 的目标占比，pool = e + sc，e = pool − sc。
+   所以 want0 调高 → 更多能量进 sc → e 反而降。要抬 e 必须给负值。
+   （这一点是实测踩出来的：初版给 +0.30，第 9 箱从 0.72 掉到 0.71。） */
+function wrAddr(mode) {
+  WR_E.fill(0);
+  wrAddrMode = mode;
+  if (mode === 1) WR_E[9] = -1.00;
+  else if (mode === 2) WR_E[0] = 1.00;
+  else if (mode === 3) { for (let i = 0; i < 16; i++) WR_E[i] = 0.40; }
+  phReset();
+}
+let inSeed = 20261116, statMC = 0, statHalf = 0, statR0 = 0, statPeak = 0, statPeakLag = 0, statInReady = false, mcCurve = null;
+/* 按出生半径分 8 档读 e 与 m：同档内 rbirth 相近、输入权重 win 也相近，
+   所以这一档的平均不会被相位抹平 —— 64 条地址的平均就做不到（条内 rbirth 跨度过大） */
+const eBin = new Float64Array(8), mBin = new Float64Array(8), binCnt = new Float64Array(8);
+
+/* xorshift32 → 二值 ±1 → 一阶低通成慢变输入（τ ≈ 20 步 = 5 s）
+   ── 为什么必须低通（本轮实测得出）────────────────────────────────
+   三档相位调制（INSEL 0 / 0.60 / 1.00）实测：
+     MC 3.7 → 4.3 → 4.3（满分 17），饱和不动
+     lag0 R² 0.15 → 0.15 → 0.25（只有瞬时增益）
+     C₀ 0.483 → 0.463 → 0.391（单调掉 19%）
+   诊断：CLK 的推进速率被 u 调制，u 是高通白噪声，所以 CLK 的游走
+   σ ∝ sqrt(t) 会在下一步被抵消，有效记忆长度 = 1 步 —— 相位通道确实
+   通了，但通的是直通，不是记忆。要累积，输入自身必须先慢下来：
+   慢变输入 → CLK 的相位偏移是单调漂移，不被后续输入抹平。
+   注意：uIn 同时进 plantGain 与 k0（幅度路），所以这条改动会让 e
+   整体慢漂，基线档也要重测。 */
+let inSlow = 0;
+function inNext() {
+  inSeed ^= inSeed << 13; inSeed ^= inSeed >>> 17; inSeed ^= inSeed << 5;
+  const raw = ((inSeed >>> 0) & 1) ? 1 : -1;
+  inSlow += (raw - inSlow) * 0.05;
+  return inSlow;
+}
+/* 每帧调一次，在 physPass 之前 —— 输入先生效、再推进物理、再采样，
+   这样 x(t) 里已经含着 u(t) 的一步响应，对齐没有歧义 */
+function inTick() {
+  inTickN++;
+  if (inTickN % IN_SAMP === 0) { IN_VAL = inNext(); inPhase = 1; }
+}
+/* 统计块末尾调一次 */
+/* ── 在线自预测（B 路线：内部目标，无外部标签）──────────────────────
+   学的是"我自己下一步会变成什么"：用 ⟨e⟩ 的上一步值预测本步值。
+   为什么换成自预测而不是外部输入：外部目标 + 全局输入学出来只是"离线回归的
+   在线版"，学完反馈进物理不会产生新行为；自预测不需要任何标签，δ 本身就是
+   "我错多少"，反馈进 k0 就是按置信度调塑性 —— 这才是世界模型的雏形。
+   判据只有一个：δ 的 RMS 是否随时间下降。降 → 能学；不降 → 承认不可预测。
+
+   实测三条（同一档 256 步记录）：
+     lag 1、单变量 ⟨e⟩        δ 0.412 → 0.172   w → 1.00
+     lag 1、双变量 +⟨m⟩       δ 0.180           w 0.98 / 0.46   ← m 对一步无增量
+     lag 23（5.75 s）双变量   δ 0.189           w 1.09 / 0.48   ← m 对中程也无增量
+   结论：⟨e⟩ 的可预测性只有一步，而且是"复制上一步"这种零结构的持续性；
+   把 m 加进来、把预测推远，δ 都变差。也就是说 m 是一条延迟线（记住输入，
+   0.52 @ 5.75 s），不是一个预测器（对 e 的未来没有信息）。
+   "记忆"和"能预测未来"在这里是两件事 —— 这正是它离真正世界模型还差的那一层，
+   要靠 P2 的误差闭环补，不是加参数能补的。 */
+const ON_LAG = 11, ON_NB = 24;
+let onW1 = 0, onW2 = 0, onSse = 0, onN = 0, onD = 0, onSse0 = 0, onN0 = 0, onD0 = 0;
+const onEHist = new Float64Array(ON_NB), onMHist = new Float64Array(ON_NB);
+let onHistI = 0, onHistN = 0;
+function inOnline() {
+  onEHist[onHistI] = statE;
+  onMHist[onHistI] = statM;
+  onHistI = (onHistI + 1) % ON_NB;
+  if (onHistN < ON_NB) onHistN++;
+  if (onHistN <= ON_LAG) return;
+  /* 双变量、11 步延迟（= CLK 整一圈）：x1 = 一圈前的 ⟨e⟩，x2 = 一圈前的 ⟨m⟩。
+     相位条件方差给出 statPh ≈ 0.976 —— ⟨e⟩ 的方差几乎全部被 CLK 相位解释，
+     也就是 e 是一个以 3.74 s 为周期的稳定形状。
+     一圈帧数 = 2π/0.028 ≈ 224.4 帧，而采样是 20 帧一步，所以整圈 = 11.2 步，
+     取 11。先前试过 lag 15（=1.34 圈）δ 反而升到 0.225，lag 23（=2.05 圈）
+     是 0.189 —— 都在"圈上对不齐"这个坑里，不是"没有周期结构"。
+     如果 lag 11 的 δ 明显低于一步的 0.172，就说明周期结构真实存在且可学，
+     那也正是"8 维当预测器"唯一站得住的根据：按相位索引，不按步数。 */
+  const j = (onHistI - ON_LAG - 1 + ON_NB) % ON_NB;
+  const y = statE;
+  const x1 = onEHist[j], x2 = onMHist[j];
+  const d = y - (onW1 * x1 + onW2 * x2);
+  const nrm = x1 * x1 + x2 * x2 + 1e-6;
+  onW1 += 0.05 * d * x1 / nrm;
+  onW2 += 0.05 * d * x2 / nrm;
+  onSse += d * d; onN++;
+  if (onN <= 40) { onSse0 += d * d; onN0++; onD0 = Math.sqrt(onSse0 / onN0); }
+  onD = Math.sqrt(onSse / onN);
+}
+/* ── 相位条件方差（查"8 维能不能建成预测器"的前置条件）──────────────
+   问题：如果把 ψ/CLK 当环形时间索引存记忆、指望它能预测，前提是
+   "e 在同一个相位上每次都长得差不多"。这条检验不改物理，只统计：
+   按 CLK 相位分 16 个箱，算箱内方差能吃掉总方差的多少。
+   R² = 1 − Σ箱内方差 / 总方差。接近 0 → e 与相位无关，相位索引存的就是噪声；
+   接近 1 → e 有可复现的相位形状，索引记忆才有内容。 */
+const PH_NB = 16;
+let phSum = new Float64Array(PH_NB), phSq = new Float64Array(PH_NB), phN = new Float64Array(PH_NB);
+let phTot = 0, phTotSq = 0, phTotN = 0, statPh = 0;
+let phPv = new Float64Array(PH_NB), phPvReady = new Uint8Array(PH_NB), phLastBox = -1;
+let predSse = 0, predN = 0, predD = 0;
+
+/* ── 8 维解码：一次能解出几个互相独立的量 ─────────────────────────
+   已证相位能解释 ⟨e⟩ 的 97.8% 方差、跨圈 δ 0.017。但"能解 1 个"和"能解几个独立的"
+   是两回事：如果 4 个量的相位形状都只是同一条曲线的缩放，那解码带宽仍然是 1。
+   所以这里同时按 ψ 分 16 箱累计 4 个量（⟨e⟩、⟨m⟩、⟨dm/dt⟩、⟨lvl⟩），
+   各算相位 R² 与跨圈 δ，再对 4×16 的箱均值矩阵做去均值后的相关矩阵特征值分解，
+   用参与率 (Σλ)²/Σλ² 当"有效独立解码通道数"。 */
+const DEC_K = 4;
+const DEC_NAME = ['⟨e⟩', '⟨m⟩', '⟨dm/dt⟩', '⟨lvl⟩'];
+let phSumK = [], phSqK = [], phPvK = [], phPvReadyK = [];
+let phTotK = [], phTotSqK = [], statPhK = [], predSseK = [], predNK = [], predDK = [];
+for (let k = 0; k < DEC_K; k++) {
+  phSumK.push(new Float64Array(PH_NB)); phSqK.push(new Float64Array(PH_NB));
+  phPvK.push(new Float64Array(PH_NB)); phPvReadyK.push(new Uint8Array(PH_NB));
+  phTotK.push(0); phTotSqK.push(0); statPhK.push(0);
+  predSseK.push(0); predNK.push(0); predDK.push(0);
+}
+let statDecRank = 0, statDecK = [0, 0, 0, 0], phLastBoxK = -1;
+function phDecAcc(vs) {
+  const ph = CLK / 6.2831853;
+  const b = Math.min(PH_NB - 1, Math.max(0, Math.floor((ph - Math.floor(ph)) * PH_NB)));
+  const newBox = (b !== phLastBoxK);
+  for (let k = 0; k < DEC_K; k++) {
+    const v = vs[k];
+    if (newBox) {
+      if (phPvReadyK[k][b]) {
+        const d = v - phPvK[k][b];
+        predSseK[k] += d * d; predNK[k]++;
+        predDK[k] = Math.sqrt(predSseK[k] / predNK[k]);
+      }
+      phPvK[k][b] = v; phPvReadyK[k][b] = 1;
+    }
+    phSumK[k][b] += v; phSqK[k][b] += v * v;
+    phTotK[k] += v; phTotSqK[k] += v * v;
+    const mu = phTotK[k] / phTotN;
+    const sst = phTotSqK[k] - phTotN * mu * mu;
+    let sse = 0;
+    for (let i = 0; i < PH_NB; i++) {
+      if (phN[i] < 2) continue;
+      const m = phSumK[k][i] / phN[i];
+      sse += phSqK[k][i] - phN[i] * m * m;
+    }
+    statPhK[k] = sst > 1e-12 ? 1 - sse / sst : 0;
+  }
+  /* 有效独立通道数：把每个量的 16 箱均值去均值、标准化，算 4×4 相关矩阵，取特征值 */
+  phLastBoxK = b;
+  if (phTotN > PH_NB) {
+    const M = [];
+    for (let k = 0; k < DEC_K; k++) {
+      const row = [];
+      let mu = 0;
+      for (let i = 0; i < PH_NB; i++) { mu += phN[i] > 0 ? phSumK[k][i] / phN[i] : 0; }
+      mu /= PH_NB;
+      let sd = 1e-9;
+      for (let i = 0; i < PH_NB; i++) { const d = (phN[i] > 0 ? phSumK[k][i] / phN[i] : 0) - mu; sd += d * d; }
+      sd = Math.sqrt(sd);
+      for (let i = 0; i < PH_NB; i++) { row.push(((phN[i] > 0 ? phSumK[k][i] / phN[i] : 0) - mu) / sd); }
+      M.push(row);
+    }
+    const Cf = new Float64Array(DEC_K * DEC_K);
+    for (let a = 0; a < DEC_K; a++) for (let c = 0; c < DEC_K; c++) {
+      let s = 0; for (let i = 0; i < PH_NB; i++) s += M[a][i] * M[c][i];
+      Cf[a * DEC_K + c] = s / PH_NB;
+    }
+    const ev = jacobiEig(DEC_K, Cf);
+    let s1 = 0, s2 = 0;
+    for (let a = 0; a < DEC_K; a++) { statDecK[a] = ev[a]; s1 += ev[a]; s2 += ev[a] * ev[a]; }
+    statDecRank = s2 > 1e-12 ? (s1 * s1) / s2 : 0;
+  }
+}
+function phAcc() {
+  const ph = CLK / 6.2831853;
+  const b = Math.min(PH_NB - 1, Math.max(0, Math.floor((ph - Math.floor(ph)) * PH_NB)));
+  const v = statE;
+  /* 相位索引预测（跨圈）：相位第一次进入某个箱时，用"上一圈同一相位"的值
+     预测这一圈的 ⟨e⟩，δ = 实际 − 上一圈。这是固定延迟做不到的事 ——
+     CLK 的推进速率被输入调制 ±60%，一圈帧数在 140~358 之间变，
+     任何固定 lag 都会漂出相位；按箱索引则不漂。
+
+     实测（16 箱，61 次跨圈）：δ = 0.019，而 ⟨e⟩ 本身 σ ≈ 0.096 —— 残差只有
+     两个百分点级别。同样是预测 ⟨e⟩，四种固定延迟全部失败：
+       lag 1  → 0.172     lag 11 → 0.178     lag 15 → 0.225     lag 23 → 0.189
+     只有"按相位索引"到 0.019。差九倍的原因不是步数选错了，是坐标系选错了：
+     用时间步当坐标，周期漂；用相位当坐标，周期不漂。
+     这条就是"8 维能不能建预测器"的正面答案 —— 能，但必须按 ψ 索引，
+     不能按步数索引。 */
+  if (b !== phLastBox) {
+    phLastBox = b;
+    if (phPvReady[b]) {
+      const d = v - phPv[b];
+      predSse += d * d; predN++; predD = Math.sqrt(predSse / predN);
+    }
+    phPv[b] = v; phPvReady[b] = 1;
+  }
+  phSum[b] += v; phSq[b] += v * v; phN[b]++;
+  phTot += v; phTotSq += v * v; phTotN++;
+  const mu = phTot / phTotN;
+  const sst = phTotSq - phTotN * mu * mu;
+  let sse = 0;
+  for (let i = 0; i < PH_NB; i++) {
+    if (phN[i] < 2) continue;
+    const m = phSum[i] / phN[i];
+    sse += phSq[i] - phN[i] * m * m;
+  }
+  statPh = sst > 1e-12 ? 1 - sse / sst : 0;
+  /* 同一帧、同一相位箱，把另外三个量一起解一遍，看解码通道是不是独立的 */
+  phDecAcc([statE, statM, statDM, statLvl]);
+}
+function phReset() {
+  phSum.fill(0); phSq.fill(0); phN.fill(0); phTot = 0; phTotSq = 0; phTotN = 0; statPh = 0;
+  phPv.fill(0); phPvReady.fill(0); phLastBox = -1; predSse = 0; predN = 0; predD = 0;
+  for (let k = 0; k < DEC_K; k++) {
+    phSumK[k].fill(0); phSqK[k].fill(0); phPvK[k].fill(0); phPvReadyK[k].fill(0);
+    phTotK[k] = 0; phTotSqK[k] = 0; statPhK[k] = 0; predSseK[k] = 0; predNK[k] = 0; predDK[k] = 0;
+  }
+  statDecRank = 0;
+}
+function inSample() {
+  if (!inRecording || !inPhase) return;
+  inPhase = 0;
+  inOnline();
+  const f = new Float32Array(IN_NF);
+  f[0] = statM;
+  inSamples.push({ u: IN_VAL, uS: inSlow, x: f });
+  if (inSamples.length >= IN_N) { inRecording = false; solveMC(); }
+}
+function inToggle() {
+  if (inRecording) { inRecording = false; if (inSamples.length > IN_LAG + 24) solveMC(); return; }
+  inSamples = []; statInReady = false; statMC = 0; statHalf = 0; mcCurve = null;
+  onW1 = 0; onW2 = 0; onSse = 0; onN = 0; onD = 0; onSse0 = 0; onN0 = 0; onD0 = 0; onHistI = 0; onHistN = 0;
+  inRecording = true;
+}
+/* 高斯消元（列主元），原地 */
+function solveLin(a, v, nf) {
+  for (let c = 0; c < nf; c++) {
+    let p = c;
+    for (let r = c + 1; r < nf; r++) if (Math.abs(a[r * nf + c]) > Math.abs(a[p * nf + c])) p = r;
+    if (p !== c) {
+      for (let k = 0; k < nf; k++) { const t = a[c * nf + k]; a[c * nf + k] = a[p * nf + k]; a[p * nf + k] = t; }
+      const t2 = v[c]; v[c] = v[p]; v[p] = t2;
+    }
+    const d = a[c * nf + c];
+    if (Math.abs(d) < 1e-14) continue;
+    for (let r = c + 1; r < nf; r++) {
+      const f = a[r * nf + c] / d;
+      if (f === 0) continue;
+      for (let k = c; k < nf; k++) a[r * nf + k] -= f * a[c * nf + k];
+      v[r] -= f * v[c];
+    }
+  }
+  const w = new Float64Array(nf);
+  for (let r = nf - 1; r >= 0; r--) {
+    let s = v[r];
+    for (let k = r + 1; k < nf; k++) s -= a[r * nf + k] * w[k];
+    const d = a[r * nf + r];
+    w[r] = Math.abs(d) < 1e-14 ? 0 : s / d;
+  }
+  return w;
+}
+function solveMC() {
+  const n = inSamples.length, nf = IN_NF;
+  if (n < IN_LAG + 24) return;
+  /* ── 交叉验证（本轮新增，改动原因）───────────────────────────────
+     原实现把 R² 算在训练集内。20 个特征配 n 个样本时，无信息期望
+     R² ≈ nf/n —— IN_N=96 时这层虚高是 0.21。把滞后从 16 拉到 32 后，
+     MC 从 13.6 跳到 19.5，但其中有一大块是这层虚高，不是记忆。
+     改动：mu/sd 只用训练段算，A/b 只用训练段累加，R² 只在留出段评估。
+     这样读数才等价于"没见过的时间也还能预测"。 */
+  const nTrain = Math.floor(n * 0.66);
+  const X = new Float64Array(n * nf);
+  const mu = new Float64Array(nf), sd = new Float64Array(nf);
+  for (let i = 0; i < nTrain; i++) {
+    const x = inSamples[i].x;
+    for (let j = 0; j < nf; j++) { X[i * nf + j] = x[j]; mu[j] += x[j]; }
+  }
+  for (let i = nTrain; i < n; i++) {
+    const x = inSamples[i].x;
+    for (let j = 0; j < nf; j++) X[i * nf + j] = x[j];
+  }
+  for (let j = 0; j < nf; j++) mu[j] /= nTrain;
+  for (let i = 0; i < nTrain; i++) {
+    for (let j = 0; j < nf; j++) { const d = X[i * nf + j] - mu[j]; sd[j] += d * d; }
+  }
+  for (let j = 0; j < nf; j++) { sd[j] = Math.sqrt(sd[j] / nTrain); if (sd[j] < 1e-9) sd[j] = 1; }
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < nf; j++) X[i * nf + j] = (X[i * nf + j] - mu[j]) / sd[j];
+  }
+  const curve = new Float64Array(IN_LAG + 1);
+  let mc = 0, half = IN_LAG + 1, peakR2 = 0, peakLag = 0;
+  for (let lag = 0; lag <= IN_LAG; lag++) {
+    const A = new Float64Array(nf * nf), b = new Float64Array(nf);
+    /* 回归目标用 uS（输入的低频分量，τ≈5 s），不再用 u（±1 白噪声）。
+       原因：状态侧是 τ 4–5 s 的平滑量，用平滑量去预测单点白噪声，
+       单个滞后只占总方差的 1/16 左右，R² 必然趋近 0 —— 这不是系统没记忆，
+       是把"能不能记住慢分量"测成了"能不能预测噪声"。 */
+    let sy = 0, cntY = 0;
+    for (let i = lag; i < nTrain; i++) { sy += inSamples[i - lag].uS; cntY++; }
+    if (cntY < nf + 4) { curve[lag] = 0; continue; }
+    const ybar = sy / cntY;
+    let sst = 0, sstT = 0;
+    for (let i = lag; i < n; i++) {
+      const dy = inSamples[i - lag].uS - ybar;
+      if (i < nTrain) {
+        sst += dy * dy;
+        const xi = i * nf;
+        for (let r = 0; r < nf; r++) {
+          const xr = X[xi + r];
+          b[r] += xr * dy;
+          for (let c2 = r; c2 < nf; c2++) A[r * nf + c2] += xr * X[xi + c2];
+        }
+      } else {
+        sstT += dy * dy;
+      }
+    }
+    for (let r = 0; r < nf; r++) for (let c2 = 0; c2 < r; c2++) A[r * nf + c2] = A[c2 * nf + r];
+    let tr = 0; for (let r = 0; r < nf; r++) tr += A[r * nf + r];
+    const lam = 1e-2 * tr / nf;   /* 4 特征 / 84 训练样本 ≈ 21:1，1e-2 已够稳；加大反而压掉真信号 */
+    for (let r = 0; r < nf; r++) A[r * nf + r] += lam;
+    const w = solveLin(A, b, nf);
+    let sse = 0, cntT = 0;
+    for (let i = nTrain; i < n; i++) {
+      const xi = i * nf;
+      let p = 0;
+      for (let r = 0; r < nf; r++) p += w[r] * X[xi + r];
+      const dy = (inSamples[i - lag].uS - ybar) - p;
+      sse += dy * dy; cntT++;
+    }
+    const r2 = (sstT > 1e-12 && cntT > 2) ? 1 - sse / sstT : 0;
+    curve[lag] = r2;
+    if (r2 > 0) mc += r2;
+    if (r2 > peakR2) { peakR2 = r2; peakLag = lag; }
+  }
+  /* 半衰判据改成"从峰值往后掉到峰值一半"。
+     旧判据拿 curve[0] 当基准，但 LEAK 0.07 时 lag0 ≈ 0（当前状态与当前输入无关），
+     0 的一半还是 0，半衰会恒等于 1 —— 判据本身失效，不是记忆失效。 */
+  let pk = peakR2 > 0.01 ? peakR2 : 0.01;
+  half = IN_LAG + 1;
+  for (let l = peakLag + 1; l <= IN_LAG; l++) {
+    if (curve[l] < 0.5 * pk) { half = l - peakLag; break; }
+  }
+  mcCurve = curve;
+  statMC = mc;
+  statHalf = half;
+  statPeak = peakR2;
+  statPeakLag = peakLag;
+  statR0 = curve[0];
+  statInReady = true;
+  window.__mc = { mc: mc, curve: Array.from(curve), n: n, lag: IN_LAG };
+  console.log('MC', mc.toFixed(3), 'halfK', half, Array.from(curve).map(function (v) { return v.toFixed(3); }).join(' '));
+}
+/* 导出曲线：按 O */
+function inDump() {
+  if (!mcCurve) return;
+  const out = ['# memory capacity | n=' + inSamples.length + ' lag=' + IN_LAG + ' MC=' + statMC.toFixed(4)];
+  out.push('lag,seconds,R2');
+  for (let k = 0; k <= IN_LAG; k++) out.push([k, (k * 0.25).toFixed(2), mcCurve[k].toFixed(4)].join(','));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'text/csv' }));
+  a.download = 'pi5-mc.csv';
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+}
+
+function schedule() {
+  cancelAnimationFrame(rafId);
+  clearTimeout(timerId);
+  if (document.hidden) timerId = setTimeout(function () { frame(performance.now()); }, 900);
+  else rafId = requestAnimationFrame(frame);
+}
+document.addEventListener('visibilitychange', function () { if (!document.hidden) schedule(); });
+
+gl.clearColor(0.0157, 0.0235, 0.0392, 1.0);
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.ONE, gl.ONE);
+
+/* 预热几步，让数值稳定再上屏 */
+for (let k = 0; k < 300; k++) { physPass(); }
+
+schedule();
+</script>
+</body>
+</html>
