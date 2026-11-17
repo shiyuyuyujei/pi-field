@@ -1,6 +1,6 @@
 # π-Field — a 10,000-point five-dimensional field with four-force dynamics
 
-A single self-contained HTML file. Open it, and a 10,000-node graph (16,615 edges, 4 neighbours per node) runs a five-dimensional spring system on your GPU, in real time. The radial force between each pair of neighbours is six terms, grouped into four roles:
+A single self-contained HTML file. Open it, and a 10,000-node graph (about 16,500 undirected edges — the exact count varies by ±60 between loads, because the k-nearest-neighbour graph is built from a random initial embedding; 4 neighbours per node) runs a five-dimensional spring system on your GPU, in real time. The radial force between each pair of neighbours is six terms, grouped into four roles:
 
 | role | term in `PHYS_FS` | parameter |
 |---|---|---|
@@ -24,21 +24,25 @@ What makes it more than a pretty particle demo is that it **measures its own sta
 
 The page computes a rolling time-average over the last 96 statistic samples (labelled `时间平均 ⟨26 s⟩`). **Read that row, not the instantaneous row** — the instantaneous value swings ±0.3 because the statistics are phase-locked to the internal clock.
 
-Measured on the test machine (1366×768, 9–13 fps, integrated-class GPU):
+Measured on the test machine (1366×768, 9–30 fps, integrated-class GPU):
 
 | quantity | symbol in HUD | value |
 |---|---|---|
 | effective dimensionality | `有效维数 PR` | **6.6 ± 0.2**, of a maximum of 7 |
-| occupied 5-D volume | `坐标5` | **4.98 ± 0.03** (x₀x₁x₂ 3.0 · x₃x₄ 2.0) |
-| nearest-neighbour correlation | `近邻相关 C₀` | **0.49 – 0.52** |
+| occupied 5-D volume | `坐标5` | **4.97 ± 0.02** (x₀x₁x₂ 3.0 · x₃x₄ 2.0) |
+| nearest-neighbour correlation | `近邻相关 C₀` | **0.47 – 0.53** |
 | mean energy | `⟨e⟩` | **0.83** |
+| phase-conditional R² of ⟨e⟩ | `相位 R²` | **0.98 – 1.00** |
+
+The `相位 R²` row is visible by default (it is not gated behind a keypress): it is the fraction of ⟨e⟩'s variance explained by the phase of the internal clock, and near-1.0 means ⟨e⟩ is a stable 3.74 s periodic shape rather than noise.
 
 So: a 5-dimensional system, driven by four forces, is using **6.6 of its 7 possible degrees of freedom** — it is not collapsing into a low-dimensional attractor, and it is not saturating. That is the whole claim. Everything else is instrumentation.
 
-### Two honest caveats, up front
+### Three honest caveats, up front
 
-1. **The number drifts.** This system slowly loses energy (a documented burn-out past ~55 s of simulated time). Over two minutes of wall-clock the same run goes `PR 6.6 → 6.3`, `坐标5 4.98 → 4.74`, `活性 93.7% → 89.2%`. Quote the first full window, not the latest reading.
-2. **The `⟨26 s⟩` label assumes 60 fps.** It counts 96 × 16 frames. At 60 fps that is 26 s of wall-clock; on a slow GPU it takes longer to fill. The buffer fills either way — just wait for the row to show numbers instead of `—`.
+1. **The number drifts.** This system slowly loses energy (a documented burn-out past ~55 s of simulated time). Over the first two minutes of wall-clock the same run goes `PR 6.66 → 6.39`, `坐标5 4.97 → 4.81`, `C₀ 0.53 → 0.47`, `ξ 0.039 → 0.022`, while `⟨e⟩` stays flat at 0.82–0.84. Activity is not monotonic — it oscillates between roughly 90 % and 99 %. Quote the first full window, not the latest reading.
+2. **The `⟨26 s⟩` label assumes 60 fps.** It counts 96 × 16 frames and prints the elapsed time as if every frame were 1/60 s. At 30 fps that same buffer takes ~90 s of wall-clock to fill; at 10 fps, ~2.5 min. The buffer fills either way — just wait for the row to show numbers instead of `—`. This also means the sim's own elapsed time differs between machines at the same label, so treat the label as a frame count, not a stopwatch.
+3. **The edge count is not a constant, and one HUD string is stale.** The header prints the true `连接 N` for that load; the line further down that reads `（16621 条边）` is a hard-coded legacy string. On four reloads the real counts were 16524 / 16549 / 16584 / 16619. Trust the header.
 
 If you want the parameter table, the failed-experiment log, and the derivation of the four force terms, they are in the companion documents, not here. This repo is deliberately just the thing you can run.
 
@@ -46,11 +50,11 @@ If you want the parameter table, the failed-experiment log, and the derivation o
 
 ## Reproduce in ten minutes
 
-1. Download `index.html` (139 KB). Put it anywhere.
+1. Download `index.html` (136 KB, 139,275 bytes). Put it anywhere.
 2. Double-click it. It opens in any WebGL2 browser — Chrome, Edge, Firefox. Nothing to install.
 3. Press **I** once to run the memory-capacity probe (optional, ~30 s).
-4. Watch the `时间平均 ⟨26 s⟩` row until the dashes turn into numbers (roughly 30 s on a fast GPU, up to ~2 min on a slow one).
-5. Read four numbers: `PR`, `坐标5`, `C₀`, `⟨e⟩`.
+4. Watch the `时间平均 ⟨N s⟩` row until the dashes turn into numbers — about 45 s at 30 fps, longer on a slow GPU.
+5. Read five numbers: `PR`, `坐标5`, `C₀`, `⟨e⟩`, `相位 R²`.
 
 Other keys, if you want them:
 
@@ -71,13 +75,13 @@ The interesting claim is not "it looks alive" — it is that **dimensionality is
 - Baseline: `PR ≈ 6.5`, `坐标5 ≈ 4.8`.
 - Now press `W` to inject energy into the write channel. In the author's logs this *costs* about 0.1–0.3 PR and buys spatial coherence (`C₀` rises). If you see PR collapse below 5.5 or the activity percentage fall under 90 % within a minute, the configuration is outside its valid range and the numbers should be discarded, not explained away.
 
-A claim that would be worth arguing about: **adding an 8th dimension does not damage the first 7**. The author's sweeps put the 7-axis PR at 6.89–6.91 with and without the extra oscillator, i.e. the new degree of freedom is free. If someone reproduces this and finds PR dropping by ≥ 1.0, that result contradicts the design note in the source and is the more interesting outcome.
+A claim that would be worth arguing about: **adding an 8th dimension does not damage the first 7**. With the spatial drive switched off, the author's sweeps put the 7-axis PR at 6.89–6.91 with and without the extra oscillator, i.e. the new degree of freedom is free. (The default build you see on screen runs *with* the drive on, which is why the header shows ~6.5 — the 6.90 figure is the no-drive control, not the shipping default.) If someone reproduces this and finds PR dropping by ≥ 1.0, that result contradicts the design note in the source and is the more interesting outcome.
 
 ---
 
 ## Status
 
-This is a working prototype with a documented research trail, not a validated result. Roughly two dozen configurations were tried and abandoned; the log of those failures (and why each failed) is in the companion documents. The three quantities above are reproducible on any WebGL2 machine, modulo the frame-rate caveat. What has **not** been established is any downstream task performance — the memory-capacity probe is a diagnostic of the reservoir, not a benchmark.
+This is a working prototype with a documented research trail, not a validated result. Roughly two dozen configurations were tried and abandoned; the log of those failures (and why each failed) is in the companion documents. The numbers above are reproducible on any WebGL2 machine, modulo the frame-rate and drift caveats. What has **not** been established is any downstream task performance — the memory-capacity probe is a diagnostic of the reservoir, not a benchmark.
 
 If you work on reservoir computing, on latent-space prediction, or on high-dimensional neural fields, the interesting question is whether this 6.6-of-7 occupancy behaves like a reservoir with useful fading memory, or whether it is just high-dimensional noise that happens to look structured. The probe in the page is the cheapest way to find out.
 
@@ -85,12 +89,12 @@ If you work on reservoir computing, on latent-space prediction, or on high-dimen
 
 ## 中文概述
 
-一个自包含的单文件 HTML：打开即在 GPU 上实时跑 10,000 个节点、16,615 条边的五维弹簧系统。每对邻居之间的径向力由六项组成，归成四类：弹性约束（势井，`STIFF`）、短程排斥（强力通道，`REP`）、长程吸引/排斥（`GR` / `EL`）、随节点自身相位交替的力（`KS`），再加一项由本地能量偏离生成的短程力（弱力，`QW`）。源码里明确写着：**电磁导流通道已关闭**（`EM 0.0`）—— 三种写法实测都让球持续膨胀、PR 掉约 1，因此直接撤除而不是继续调参。它不只画图，还把自身状态**量出来打在界面上**。
+一个自包含的单文件 HTML：打开即在 GPU 上实时跑 10,000 个节点、约 1.65 万条无向边（每次加载略有不同，实测四次为 16524 / 16549 / 16584 / 16619，因为 k 近邻图由随机初始嵌入生成；每点 4 邻居）的五维弹簧系统。每对邻居之间的径向力由六项组成，归成四类：弹性约束（势井，`STIFF`）、短程排斥（强力通道，`REP`）、长程吸引/排斥（`GR` / `EL`）、随节点自身相位交替的力（`KS`），再加一项由本地能量偏离生成的短程力（弱力，`QW`）。源码里明确写着：**电磁导流通道已关闭**（`EM 0.0`）—— 三种写法实测都让球持续膨胀、PR 掉约 1，因此直接撤除而不是继续调参。它不只画图，还把自身状态**量出来打在界面上**。
 
-关键读数是 `时间平均 ⟨26 s⟩` 那一行（滚动平均，不是瞬时行）：实测 **有效维数 PR 6.6±0.2 / 7**、**坐标5 4.98±0.03**、**近邻相关 C₀ 0.49–0.52**、**⟨e⟩ 0.83**。即：五维系统、四力驱动，占用了 7 个可能自由度里的 6.6 个 —— 既没有塌成低维吸引子，也没有饱和。
+关键读数是 `时间平均 ⟨N s⟩` 那一行（滚动平均，不是瞬时行）：实测 **有效维数 PR 6.6±0.2 / 7**、**坐标5 4.97±0.02**、**近邻相关 C₀ 0.47–0.53**、**⟨e⟩ 0.83**、**相位 R² 0.98–1.00**。即：五维系统、四力驱动，占用了 7 个可能自由度里的 6.6 个 —— 既没有塌成低维吸引子，也没有饱和。其中 `相位 R²` 默认就显示，不需要按键，它表示 ⟨e⟩ 的方差被内部时钟相位解释的比例，接近 1 说明 ⟨e⟩ 是一个 3.74 s 的稳定周期形状、不是噪声。
 
-两点必须说明：**① 数字会漂** —— 系统在仿真时间约 55 s 后开始缓慢流失能量，两分钟内同一轮运行 `PR 6.6 → 6.3`、`坐标5 4.98 → 4.74`、活性 `93.7% → 89.2%`；引用第一个完整窗口，不要引用最新一帧。**② `⟨26 s⟩` 这个标签按 60 fps 折算** —— 它数的是 96×16 帧，快机器上约 26 秒填满，慢机器上要一两分钟；等那一行从 `—` 变成数字即可。
+三点必须说明：**① 数字会漂** —— 系统在仿真时间约 55 s 后开始缓慢流失能量，前两分钟内同一轮运行 `PR 6.66 → 6.39`、`坐标5 4.97 → 4.81`、`C₀ 0.53 → 0.47`、`ξ 0.039 → 0.022`，而 `⟨e⟩` 稳定在 0.82–0.84；活性不是单调下跌，而是在约 90%–99% 之间摆动。引用第一个完整窗口，不要引用最新一帧。**② `⟨26 s⟩` 这个标签按 60 fps 折算** —— 它数的是 96×16 帧，30 fps 下要约 90 秒才填满，10 fps 下约两分半；请把它当帧数，不要当秒表。**③ 边数不是常量，且 HUD 里有一处写死的旧值** —— 顶部 `连接 N` 是当次真实值，下面那句「（16621 条边）」是硬编码字符串，以顶部为准。
 
-复现：下载 `index.html`（139 KB），双击，等 `时间平均` 行出数，读四个数。可选的 `I` 键跑记忆容量探针，`D` 键导出全部状态。
+复现：下载 `index.html`（136 KB / 139,275 字节），双击，等 `时间平均` 行出数，读五个数。可选的 `I` 键跑记忆容量探针，`D` 键导出全部状态。
 
-**状态**：这是带完整失败记录的可用原型，不是已验证的结论。约二十余种配置试过并放弃，失败原因在配套文档里。上述三个量在任何 WebGL2 机器上可复现（受帧率影响）。**尚未建立**的是任何下游任务表现 —— 记忆容量探针是储备池的诊断，不是基准测试。
+**状态**：这是带完整失败记录的可用原型，不是已验证的结论。约二十余种配置试过并放弃，失败原因在配套文档里。上述几个量在任何 WebGL2 机器上可复现（受帧率影响）。**尚未建立**的是任何下游任务表现 —— 记忆容量探针是储备池的诊断，不是基准测试。
