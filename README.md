@@ -1,5 +1,7 @@
 # π-Field — a 10,000-point five-dimensional field with four-force dynamics
 
+**Open it live: https://shiyuyuyujei.github.io/pi-field/** — or download `index.html` and double-click it. Nothing to install, no build step, no account.
+
 A single self-contained HTML file. Open it, and a 10,000-node graph (about 16,500 undirected edges — the exact count varies by ±60 between loads, because the k-nearest-neighbour graph is built from a random initial embedding; 4 neighbours per node) runs a five-dimensional spring system on your GPU, in real time. The radial force between each pair of neighbours is six terms, grouped into four roles:
 
 | role | term in `PHYS_FS` | parameter |
