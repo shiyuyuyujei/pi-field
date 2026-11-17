@@ -42,7 +42,7 @@ So: a 5-dimensional system, driven by four forces, is using **6.6 of its 7 possi
 
 1. **The number drifts.** This system slowly loses energy (a documented burn-out past ~55 s of simulated time). Over the first two minutes of wall-clock the same run goes `PR 6.66 → 6.39`, `坐标5 4.97 → 4.81`, `C₀ 0.53 → 0.47`, `ξ 0.039 → 0.022`, while `⟨e⟩` stays flat at 0.82–0.84. Activity is not monotonic — it oscillates between roughly 90 % and 99 %. Quote the first full window, not the latest reading.
 2. **The `⟨26 s⟩` label assumes 60 fps.** It counts 96 × 16 frames and prints the elapsed time as if every frame were 1/60 s. At 30 fps that same buffer takes ~90 s of wall-clock to fill; at 10 fps, ~2.5 min. The buffer fills either way — just wait for the row to show numbers instead of `—`. This also means the sim's own elapsed time differs between machines at the same label, so treat the label as a frame count, not a stopwatch.
-3. **The edge count is not a constant, and one HUD string is stale.** The header prints the true `连接 N` for that load; the line further down that reads `（16621 条边）` is a hard-coded legacy string. On four reloads the real counts were 16524 / 16549 / 16584 / 16619. Trust the header.
+3. **The edge count is not a constant, and one HUD string is stale.** The header prints the true `连接 N` for that load; the line further down that reads `（16621 条边）` is a hard-coded legacy string. On five reloads the real counts were 16524 / 16549 / 16584 / 16589 / 16619. Trust the header. The source now carries an inline note at that line, plus a header block documenting all of the above, so anyone reading the code hits the same explanation.
 
 If you want the parameter table, the failed-experiment log, and the derivation of the four force terms, they are in the companion documents, not here. This repo is deliberately just the thing you can run.
 
@@ -50,7 +50,7 @@ If you want the parameter table, the failed-experiment log, and the derivation o
 
 ## Reproduce in ten minutes
 
-1. Download `index.html` (136 KB, 139,275 bytes). Put it anywhere.
+1. Download `index.html` (143 KB, 146,586 bytes). Put it anywhere.
 2. Double-click it. It opens in any WebGL2 browser — Chrome, Edge, Firefox. Nothing to install.
 3. Press **I** once to run the memory-capacity probe (optional, ~30 s).
 4. Watch the `时间平均 ⟨N s⟩` row until the dashes turn into numbers — about 45 s at 30 fps, longer on a slow GPU.
@@ -89,12 +89,12 @@ If you work on reservoir computing, on latent-space prediction, or on high-dimen
 
 ## 中文概述
 
-一个自包含的单文件 HTML：打开即在 GPU 上实时跑 10,000 个节点、约 1.65 万条无向边（每次加载略有不同，实测四次为 16524 / 16549 / 16584 / 16619，因为 k 近邻图由随机初始嵌入生成；每点 4 邻居）的五维弹簧系统。每对邻居之间的径向力由六项组成，归成四类：弹性约束（势井，`STIFF`）、短程排斥（强力通道，`REP`）、长程吸引/排斥（`GR` / `EL`）、随节点自身相位交替的力（`KS`），再加一项由本地能量偏离生成的短程力（弱力，`QW`）。源码里明确写着：**电磁导流通道已关闭**（`EM 0.0`）—— 三种写法实测都让球持续膨胀、PR 掉约 1，因此直接撤除而不是继续调参。它不只画图，还把自身状态**量出来打在界面上**。
+一个自包含的单文件 HTML：打开即在 GPU 上实时跑 10,000 个节点、约 1.65 万条无向边（每次加载略有不同，实测五次为 16524 / 16549 / 16584 / 16589 / 16619，因为 k 近邻图由随机初始嵌入生成；每点 4 邻居）的五维弹簧系统。每对邻居之间的径向力由六项组成，归成四类：弹性约束（势井，`STIFF`）、短程排斥（强力通道，`REP`）、长程吸引/排斥（`GR` / `EL`）、随节点自身相位交替的力（`KS`），再加一项由本地能量偏离生成的短程力（弱力，`QW`）。源码里明确写着：**电磁导流通道已关闭**（`EM 0.0`）—— 三种写法实测都让球持续膨胀、PR 掉约 1，因此直接撤除而不是继续调参。它不只画图，还把自身状态**量出来打在界面上**。
 
 关键读数是 `时间平均 ⟨N s⟩` 那一行（滚动平均，不是瞬时行）：实测 **有效维数 PR 6.6±0.2 / 7**、**坐标5 4.97±0.02**、**近邻相关 C₀ 0.47–0.53**、**⟨e⟩ 0.83**、**相位 R² 0.98–1.00**。即：五维系统、四力驱动，占用了 7 个可能自由度里的 6.6 个 —— 既没有塌成低维吸引子，也没有饱和。其中 `相位 R²` 默认就显示，不需要按键，它表示 ⟨e⟩ 的方差被内部时钟相位解释的比例，接近 1 说明 ⟨e⟩ 是一个 3.74 s 的稳定周期形状、不是噪声。
 
 三点必须说明：**① 数字会漂** —— 系统在仿真时间约 55 s 后开始缓慢流失能量，前两分钟内同一轮运行 `PR 6.66 → 6.39`、`坐标5 4.97 → 4.81`、`C₀ 0.53 → 0.47`、`ξ 0.039 → 0.022`，而 `⟨e⟩` 稳定在 0.82–0.84；活性不是单调下跌，而是在约 90%–99% 之间摆动。引用第一个完整窗口，不要引用最新一帧。**② `⟨26 s⟩` 这个标签按 60 fps 折算** —— 它数的是 96×16 帧，30 fps 下要约 90 秒才填满，10 fps 下约两分半；请把它当帧数，不要当秒表。**③ 边数不是常量，且 HUD 里有一处写死的旧值** —— 顶部 `连接 N` 是当次真实值，下面那句「（16621 条边）」是硬编码字符串，以顶部为准。
 
-复现：下载 `index.html`（136 KB / 139,275 字节），双击，等 `时间平均` 行出数，读五个数。可选的 `I` 键跑记忆容量探针，`D` 键导出全部状态。
+复现：下载 `index.html`（143 KB / 146,586 字节），双击，等 `时间平均` 行出数，读五个数。可选的 `I` 键跑记忆容量探针，`D` 键导出全部状态。源码里已就地加注：文件头有整段口径说明，边数硬编码处、时间标签处、6.90 基线处、0.976 相位 R² 处各有标注，读代码不会误读。
 
 **状态**：这是带完整失败记录的可用原型，不是已验证的结论。约二十余种配置试过并放弃，失败原因在配套文档里。上述几个量在任何 WebGL2 机器上可复现（受帧率影响）。**尚未建立**的是任何下游任务表现 —— 记忆容量探针是储备池的诊断，不是基准测试。
