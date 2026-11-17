@@ -69,7 +69,7 @@ English version below. 英文版见下半部分。
 
 ### 十分钟复现
 
-1. 下载 `index.html`（143 KB / 146,586 字节），放在任意位置。
+1. 下载 `index.html`（约 143.5 KB / 146,931 字节），放在任意位置。
 2. 双击打开。任何支持 WebGL2 的浏览器都行 —— Chrome、Edge、Firefox。不用安装。
 3. 按一次 **I** 键跑记忆容量探针（可选，约 30 s）。
 4. 看 `时间平均 ⟨N s⟩` 那一行，等到横杠变成数字 —— 30 fps 下约 45 s，慢显卡更久。
@@ -156,7 +156,7 @@ If you want the parameter table, the failed-experiment log, and the derivation o
 
 ### Reproduce in ten minutes
 
-1. Download `index.html` (143 KB, 146,586 bytes). Put it anywhere.
+1. Download `index.html` (about 143.5 KB, 146,931 bytes). Put it anywhere.
 2. Double-click it. It opens in any WebGL2 browser — Chrome, Edge, Firefox. Nothing to install.
 3. Press **I** once to run the memory-capacity probe (optional, ~30 s).
 4. Watch the `时间平均 ⟨N s⟩` row until the dashes turn into numbers — about 45 s at 30 fps, longer on a slow GPU.
