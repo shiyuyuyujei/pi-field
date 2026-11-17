@@ -18,12 +18,23 @@
   }
   #hud {
     left: 16px; top: 14px;
-    padding: 8px 12px 9px 12px;
-    max-width: 62ch;
-    background: rgba(4, 6, 10, .84);
+    padding: 7px 10px 8px 10px;
+    /* 面板缩到约原来一半：宽度 60vw、高度锁 46vh，超出部分滚轮上下翻页。
+       pointer-events 在这里放开，滚轮才会落在面板上而不是穿透到画布。 */
+    width: min(60vw, 30rem);
+    max-height: 46vh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    pointer-events: auto;
+    background: rgba(4, 6, 10, .86);
     border-radius: 3px;
     box-shadow: 0 0 0 1px rgba(110, 170, 190, .12);
+    scrollbar-width: thin;
+    scrollbar-color: rgba(110, 170, 190, .32) transparent;
   }
+  #hud::-webkit-scrollbar { width: 6px; }
+  #hud::-webkit-scrollbar-track { background: transparent; }
+  #hud::-webkit-scrollbar-thumb { background: rgba(110, 170, 190, .30); border-radius: 3px; }
   #hud b { color: rgba(214, 244, 252, .96); font-weight: 600; }
 </style>
 </head>
@@ -2039,6 +2050,8 @@ function frame(now) {
   }
   inSample();
 
+  /* 面板可滚动，但这行每帧重建 innerHTML —— 不保存的话每次刷新都会跳回顶部 */
+  const hudScroll = hud.scrollTop;
   hud.innerHTML =
     '五维场 · <b>完美世界</b>&nbsp;&nbsp;ℝ<sup>5</sup> · <b>全 GPU</b> · 种子 伪随机（无 π）<br>' +
     '点 <b>' + NP + '</b> · 连接 <b>' + EDGE_N + '</b> · 每点 <b>' + K + '</b> 边<br>' +
@@ -2097,6 +2110,7 @@ function frame(now) {
     (TRK.on ? ' · #' + TRK.idx + ' ' + TRK.rows.length + ' 样本' : '') + '<br>' +
     '视图 <b>' + (VIEW3 ? 'x₀x₁x₂ 三维' : 'ℝ⁵ 拍扁') + '</b> · 按 <b>V</b> 切换 · 按 <b>R</b> 录制' +
     (REC ? ' · <b style="color:#ff5a40">REC ' + ((performance.now() - recT0) / 1000).toFixed(1) + 's</b>' : '');
+  if (hudScroll > 0) hud.scrollTop = hudScroll;
 
   schedule();
 }
